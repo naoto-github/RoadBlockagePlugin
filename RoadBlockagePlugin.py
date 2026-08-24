@@ -1,9 +1,10 @@
-from UCwinRoadCOM import *
+﻿from UCwinRoadCOM import *
 from UCwinRoadCOM import *
 from LoggerProxy import LoggerProxy
 from UCwinRoadUtils import *
 from CallbackHandlers import *
 import time
+import traceback
 import win32com.client as com
 
 # APIのエントリポイント
@@ -16,52 +17,45 @@ logProxy = None
 # リボンUI
 ribbon = None
 
-# 設置済みの閉塞（ブロッキング車両）のリスト
-blockageList = []
-blockageIdCounter = 0
+
+# 現在のメインカメラの位置(ローカル座標)を緯度経度に変換して取得する
+# ローカル座標は X, Z が水平面、Y が高さなので、水平面変換には X, Z を使う
+def GetCameraLatLon():
+    mainCamera = winRoadProxy.MainForm.MainCamera
+    eye = mainCamera.MainCameraState.eye
+
+    srcVec2 = com.Dispatch('UCwinRoad.F8COMdVec2')
+    dstVec2 = com.Dispatch('UCwinRoad.F8COMdVec2')
+    convRes = com.Dispatch('UCwinRoad.F8COMHcsConvertResultType')
+    srcVec2.X = eye.X
+    srcVec2.Y = eye.Z
+
+    hConverter = winRoadProxy.CoordinateConverter.HorizontalCoordinateConvertor
+    hConverter.Convert(const._hcLocal_XY, const._hcWGS84_LonLat, srcVec2, dstVec2, convRes)
+
+    if not convRes.isSuccess:
+        logProxy.logger.error(
+            f"Coordinate conversion failed. isOutOfCS={convRes.isOutOfCS} isBadArray={convRes.isBadArray}")
+        return None
+
+    # WGS84 LonLat は X=経度, Y=緯度
+    longitude = dstVec2.X
+    latitude = dstVec2.Y
+    return latitude, longitude
 
 
-# 道路閉塞として設置した車両を停止させ続けるハンドラ
-# （自身が生成した閉塞インスタンスの ID のときだけ制御する）
-class BlockageInstanceHandler(HandlerBase):
-    targetID = None
-
-    def OnBeforeCalculateMovement(self, dTimeInSeconds, proxy):
-        if proxy is None:
-            return
-        instance = com.Dispatch(proxy)
-        if self.targetID is not None and instance.ID != self.targetID:
-            return
-        instance.EngineOn = False
-        instance.Throttle = 0.0
-        instance.Brake = 1.0
-        instance.Clutch = 0.0
-        instance.Steering = 0.0
-        instance.SetSpeed(const._MeterPerSecond, 0)
-        instance.PositionInTraffic = instance.Position
-
-
-class RibbonButtonHandlerPlace(RibbonButtonHandler):
+class RibbonButtonHandlerGetCameraPosition(RibbonButtonHandler):
     def OnClick(self):
         try:
-            roadName = ribbon.edit_road.Text
-            lane = int(ribbon.edit_lane.Text)
-            distance = float(ribbon.edit_distance.Text)
-            isForward = ribbon.edit_forward.Text.strip() not in ('0', 'False', 'false')
-            modelName = ribbon.edit_model.Text
-            PlaceBlockage(roadName, lane, distance, isForward, modelName)
-        except Exception as e:
-            logProxy.logger.error(f"[PlaceBlockage error] {e}")
-        winRoadProxy.MainForm.MainOpenGL.Changed()
-
-
-class RibbonButtonHandlerClear(RibbonButtonHandler):
-    def OnClick(self):
-        try:
-            ClearAllBlockages()
-        except Exception as e:
-            logProxy.logger.error(f"[ClearAllBlockages error] {e}")
-        winRoadProxy.MainForm.MainOpenGL.Changed()
+            result = GetCameraLatLon()
+            if result is None:
+                return
+            latitude, longitude = result
+            ribbon.edit_latitude.Text = str(latitude)
+            ribbon.edit_longitude.Text = str(longitude)
+            logProxy.logger.info(f"Camera position: lat={latitude}, lon={longitude}")
+        except Exception:
+            logProxy.logger.error(traceback.format_exc())
 
 
 class RibbonUI:
@@ -69,18 +63,11 @@ class RibbonUI:
         self.ribbonMenu = None
         self.ribbonTab = None
         self.ribbonGroup = None
-        self.label_road = None
-        self.edit_road = None
-        self.label_lane = None
-        self.edit_lane = None
-        self.label_distance = None
-        self.edit_distance = None
-        self.label_forward = None
-        self.edit_forward = None
-        self.label_model = None
-        self.edit_model = None
-        self.button_place = None
-        self.button_clear = None
+        self.label_latitude = None
+        self.edit_latitude = None
+        self.label_longitude = None
+        self.edit_longitude = None
+        self.button_get_camera_position = None
         self.EventList = []
 
     def MakeRibbonTab(self, Parent, partsName, caption):
@@ -134,17 +121,11 @@ class RibbonUI:
                 self.SetCallbackEvent(button, handler)
             return button
 
-    def DeleteControlFromParent(self, child, Parent):
-        if child is not None:
-            child.UnRegisterEventHandlers()
-            if Parent is not None:
-                Parent.DeleteControl(child)
-            child = None
-
     def CloseCallbackEvent(self):
         if self.EventList is not None:
             for Event in self.EventList:
                 Event.close()
+            self.EventList.clear()
 
     def MakeRibbonUI(self):
         mainForm = winRoadProxy.MainForm
@@ -153,184 +134,80 @@ class RibbonUI:
         # Tab
         self.ribbonTab = self.MakeRibbonTab(self.ribbonMenu, 'RoadBlockagePlugin', 'Road Blockage')
         # Group
-        self.ribbonGroup = self.MakeRibbonGroup(self.ribbonTab, 'GroupBlockage', 'Blockage')
+        self.ribbonGroup = self.MakeRibbonGroup(self.ribbonTab, 'GroupPosition', 'Position')
 
-        defaultRoad = FirstRoadName()
+        # 緯度
+        self.label_latitude = self.MakeRibbonLabel(self.ribbonGroup, 'LabelLatitude', 'Latitude')
+        self.edit_latitude = self.MakeRibbonEdit(self.ribbonGroup, 'EditLatitude', '')
 
-        # Road name
-        self.label_road = self.MakeRibbonLabel(self.ribbonGroup, 'LabelRoadName', 'Road')
-        self.edit_road = self.MakeRibbonEdit(self.ribbonGroup, 'EditRoadName', defaultRoad)
+        # 経度
+        self.label_longitude = self.MakeRibbonLabel(self.ribbonGroup, 'LabelLongitude', 'Longitude')
+        self.edit_longitude = self.MakeRibbonEdit(self.ribbonGroup, 'EditLongitude', '')
 
-        # Lane number
-        self.label_lane = self.MakeRibbonLabel(self.ribbonGroup, 'LabelLane', 'Lane')
-        self.edit_lane = self.MakeRibbonEdit(self.ribbonGroup, 'EditLane', '1')
-
-        # Distance along the road (m)
-        self.label_distance = self.MakeRibbonLabel(self.ribbonGroup, 'LabelDistance', 'Distance(m)')
-        self.edit_distance = self.MakeRibbonEdit(self.ribbonGroup, 'EditDistance', '0')
-
-        # Lane direction (1=forward / 0=backward)
-        self.label_forward = self.MakeRibbonLabel(self.ribbonGroup, 'LabelForward', 'Forward(1/0)')
-        self.edit_forward = self.MakeRibbonEdit(self.ribbonGroup, 'EditForward', '1')
-
-        # 3D model name used as the blockage marker (blank = first vehicle model)
-        self.label_model = self.MakeRibbonLabel(self.ribbonGroup, 'LabelModel', 'Model')
-        self.edit_model = self.MakeRibbonEdit(self.ribbonGroup, 'EditModel', '')
-
-        self.button_place = self.MakeRibbonButton(self.ribbonGroup, 'ButtonPlaceBlockage', 'Place', RibbonButtonHandlerPlace)
-        self.button_clear = self.MakeRibbonButton(self.ribbonGroup, 'ButtonClearBlockage', 'Clear All', RibbonButtonHandlerClear)
+        # 現在のカメラ位置を緯度経度に変換して入力欄に反映するボタン
+        self.button_get_camera_position = self.MakeRibbonButton(
+            self.ribbonGroup, 'ButtonGetCameraPosition', 'Get Camera Position',
+            RibbonButtonHandlerGetCameraPosition)
+        # デフォルト幅だとキャプションが収まらないため広げる
+        self.button_get_camera_position.Width = 160
 
     def KillRibbonUI(self):
+        # MakeRibbonUIが途中で失敗していても後始末できるよう、
+        # 各ステップはNoneチェックしてから実行する
         self.CloseCallbackEvent()
-        self.DeleteControlFromParent(self.button_place, self.ribbonGroup)
-        self.DeleteControlFromParent(self.button_clear, self.ribbonGroup)
-        self.ribbonGroup.DeleteControl(self.edit_model)
-        self.ribbonGroup.DeleteControl(self.label_model)
-        self.ribbonGroup.DeleteControl(self.edit_forward)
-        self.ribbonGroup.DeleteControl(self.label_forward)
-        self.ribbonGroup.DeleteControl(self.edit_distance)
-        self.ribbonGroup.DeleteControl(self.label_distance)
-        self.ribbonGroup.DeleteControl(self.edit_lane)
-        self.ribbonGroup.DeleteControl(self.label_lane)
-        self.ribbonGroup.DeleteControl(self.edit_road)
-        self.ribbonGroup.DeleteControl(self.label_road)
-        self.ribbonTab.DeleteGroup(self.ribbonGroup)
-        self.ribbonGroup = None
-        if self.ribbonTab.RibbonGroupsCount == 0:
-            self.ribbonMenu.DeleteTab(self.ribbonTab)
-        self.ribbonTab = None
+
+        if self.ribbonGroup is not None:
+            if self.button_get_camera_position is not None:
+                self.button_get_camera_position.UnRegisterEventHandlers()
+                self.ribbonGroup.DeleteControl(self.button_get_camera_position)
+                self.button_get_camera_position = None
+            for ctrl in (self.edit_longitude, self.label_longitude,
+                         self.edit_latitude, self.label_latitude):
+                if ctrl is not None:
+                    self.ribbonGroup.DeleteControl(ctrl)
+            if self.ribbonTab is not None:
+                self.ribbonTab.DeleteGroup(self.ribbonGroup)
+            self.ribbonGroup = None
+
+        if self.ribbonTab is not None:
+            if self.ribbonTab.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
+                self.ribbonMenu.DeleteTab(self.ribbonTab)
+            self.ribbonTab = None
+
         self.ribbonMenu = None
-
-
-# プロジェクト内の最初の道路名を取得（初期値表示用）
-def FirstRoadName():
-    prj = winRoadProxy.Project
-    if prj.RoadsCount > 0:
-        road = prj.Road(0)
-        if road is not None:
-            return road.Name
-    return ''
-
-
-# 名前で道路を検索
-def FindRoadByName(name):
-    prj = winRoadProxy.Project
-    count = prj.RoadsCount
-    for i in range(count):
-        road = prj.Road(i)
-        if road is not None and road.Name == name:
-            return road
-    return None
-
-
-# 閉塞マーカーに使う3Dモデルを検索
-# modelName が指定されていればその名前のモデル、なければ最初に見つかった車両モデルを使う
-def FindBlockageModel(modelName):
-    prj = winRoadProxy.Project
-    count = prj.ThreeDModelsCount
-    if modelName:
-        for i in range(count):
-            model = prj.ThreeDModel(i)
-            if model is not None and model.Name == modelName:
-                return model
-        logProxy.logger.error(f"3D model not found: {modelName}")
-        return None
-    for i in range(count):
-        model = prj.ThreeDModel(i)
-        if model is not None and model.ModelType == const._VehicleModel:
-            return model
-    return None
-
-
-# 指定した道路・車線・距離に閉塞を設置する
-def PlaceBlockage(roadName, lane, distance, isForward, modelName):
-    global blockageIdCounter
-
-    road = FindRoadByName(roadName)
-    if road is None:
-        logProxy.logger.error(f"Road not found: {roadName}")
-        return None
-
-    model = FindBlockageModel(modelName)
-    if model is None:
-        logProxy.logger.error("No 3D model available to use as a blockage marker.")
-        return None
-
-    traffic = winRoadProxy.SimulationCore.TrafficSimulation
-
-    vptype = com.DispatchEx('UCwinRoad.F8COMVehiclePlacementType')
-    vptype.IsForward = isForward
-    vptype.Lane = lane
-    vptype.Distance = distance
-
-    instance = traffic.AddNewVehicle(model, road, vptype)
-    if instance is None:
-        logProxy.logger.error("Failed to place blockage.")
-        return None
-
-    eventList = []
-    SetCallbackHandlers(eventList, instance, BlockageInstanceHandler)
-    for entry in eventList:
-        entry[1].targetID = instance.ID
-
-    blockageIdCounter += 1
-    record = {
-        'blockageID': blockageIdCounter,
-        'instance': instance,
-        'eventList': eventList,
-        'roadName': roadName,
-        'lane': lane,
-        'distance': distance,
-    }
-    blockageList.append(record)
-    logProxy.logger.info(
-        f"Placed blockage #{blockageIdCounter} on '{roadName}' lane {lane} at {distance}m (ID={instance.ID})")
-    return record
-
-
-# 閉塞を1件解除する（コールバックを解除し、車両の制御をシミュレーションに戻す）
-def ClearBlockage(record):
-    CloseCallbackEvent(record['eventList'])
-    logProxy.logger.info(f"Cleared blockage #{record['blockageID']}")
-
-
-# 設置済みの閉塞をすべて解除する
-def ClearAllBlockages():
-    for record in blockageList:
-        ClearBlockage(record)
-    blockageList.clear()
 
 
 def main():
     scriptName = 'RoadBlockagePlugin'
-    try:
-        start = time.perf_counter_ns()
+    start = time.perf_counter_ns()
 
+    global winRoadProxy
+    global const
+    global logProxy
+    global ribbon
+    winRoadProxy = None
+    logProxy = None
+    ribbon = None
+
+    try:
         # APIのエントリポイント
-        global winRoadProxy
-        global const
         winRoadProxy = UCwinRoadComProxy()
         const = winRoadProxy.const
 
         # ロガーの設定
-        global logProxy
         logfilepath = winRoadProxy.PythonPluginDirectory() + scriptName + '.log'
         logProxy = LoggerProxy(scriptName, logfilepath)
         logProxy.logger.info('Start ' + scriptName)
 
-        global blockageList
-        global blockageIdCounter
-        blockageList = []
-        blockageIdCounter = 0
-
         # リボンUIの作成
-        global ribbon
         ribbon = RibbonUI()
         ribbon.MakeRibbonUI()
+        logProxy.logger.info('Ribbon UI created')
 
         # Event Loop
         loopFlg = True
         winRoadProxy.ApplicationServices.IsPythonScriptRun = loopFlg
+        logProxy.logger.info('Loop Start')
         while loopFlg:
             time.sleep(0.005)
             loopFlg = winRoadProxy.ApplicationServices.IsPythonScriptRun
@@ -339,17 +216,32 @@ def main():
                 logProxy.logger.info("Script close")
         winRoadProxy.ApplicationServices.IsPythonScriptRun = loopFlg
 
+    except Exception:
+        # 原因不明のまま無言で落ちないよう、必ずログにトレースバックを残す
+        if logProxy is not None:
+            logProxy.logger.error(traceback.format_exc())
+        else:
+            print(traceback.format_exc())
+
     finally:
         elapsed_time = time.perf_counter_ns() - start
-        logProxy.logger.info("Total:{}ms".format(elapsed_time / 1000000))
+        if logProxy is not None:
+            logProxy.logger.info("Total:{}ms".format(elapsed_time / 1000000))
 
-        # 閉塞の解除とリボンの削除
-        ClearAllBlockages()
-        ribbon.KillRibbonUI()
+        # リボンの削除（失敗してもログ後始末は必ず行う）
+        if ribbon is not None:
+            try:
+                ribbon.KillRibbonUI()
+            except Exception:
+                if logProxy is not None:
+                    logProxy.logger.error(traceback.format_exc())
 
-        logProxy.logger.info('End ' + scriptName)
-        logProxy.killLogger()
-        del winRoadProxy
+        if logProxy is not None:
+            logProxy.logger.info('End ' + scriptName)
+            logProxy.killLogger()
+
+        if winRoadProxy is not None:
+            del winRoadProxy
 
 
 if __name__ == '__main__':
