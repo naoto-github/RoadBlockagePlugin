@@ -1,7 +1,7 @@
 ﻿import win32com.client as com
 
 class UCwinRoadComProxy:
-    PROG_ID = "UCwinRoad.UCwinRoadCom_1724"
+    PROG_ID = "UCwinRoad.UCwinRoadCom_1901"
     
     def __init__(self):
         self.UCwinRoadCOM = com.gencache.EnsureDispatch(self.PROG_ID)

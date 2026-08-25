@@ -29,7 +29,7 @@ class OpenGLSamples:
         
         glLineWidth(width)
         glEnable(GL_COLOR_MATERIAL)
-        glColor4f(1.0, 0.0, 0.0, 0.5)
+        glColor4f(0.0, 0.0, 1.0, 0.5)
         glBegin(GL_LINES)
         glVertex2d(x1, y1)
         glVertex2d(x2, y2)
@@ -39,3 +39,13 @@ class OpenGLSamples:
         glClearColor(r, g, b, a)
         glClear(GL_COLOR_BUFFER_BIT)
         glClear(GL_DEPTH_BUFFER_BIT)
+        
+    def SetOrthoView(self, rotationAngle, left, right, bottom, top):   
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+
+        glRotatef(rotationAngle, 0.0, 0.0, 1.0);
+        glOrtho(left, right, bottom, top, -1.0, 1.0);
+
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
