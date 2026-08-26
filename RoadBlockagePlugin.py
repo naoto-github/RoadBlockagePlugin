@@ -383,6 +383,7 @@ def ListObstructions():
     roadCount = prj.RoadsCount
 
     items = []
+    inspected = False
     for i in range(roadCount):
         road = prj.Road(i)
         if road is None:
@@ -392,6 +393,25 @@ def ListObstructions():
             obstruction = road.Obstruction(j)
             if obstruction is None:
                 continue
+
+            # 診断用(テスト): 最初に見つかった道路障害物オブジェクトについて、
+            # dir()/type()等でPython側から実際にどう見えているかをログに残す。
+            # 静的なtypelib走査では読み取り専用としか分からなかったため、
+            # 実物のCOMオブジェクトを取得した際に何か違いがないか確認する
+            if not inspected:
+                try:
+                    logProxy.logger.info(f'ListObstructions: inspecting obstruction object')
+                    logProxy.logger.info(f'ListObstructions: type={type(obstruction)!r}')
+                    logProxy.logger.info(f'ListObstructions: dir={dir(obstruction)!r}')
+                    logProxy.logger.info(f'ListObstructions: mro={type(obstruction).__mro__!r}')
+                    getMap = getattr(obstruction, '_prop_map_get_', None)
+                    putMap = getattr(obstruction, '_prop_map_put_', None)
+                    logProxy.logger.info(f'ListObstructions: _prop_map_get_={getMap!r}')
+                    logProxy.logger.info(f'ListObstructions: _prop_map_put_={putMap!r}')
+                except Exception:
+                    logProxy.logger.error('ListObstructions: inspection failed:\n' + traceback.format_exc())
+                inspected = True
+
             items.append((road.Name, obstruction.Description, obstruction.Distance, obstruction.Length))
 
     logProxy.logger.info(f"Found {len(items)} obstruction(s).")
