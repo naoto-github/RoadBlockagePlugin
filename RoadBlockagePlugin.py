@@ -3,18 +3,36 @@ from UCwinRoadCOM import *
 from LoggerProxy import LoggerProxy
 from UCwinRoadUtils import *
 from CallbackHandlers import *
+import csv
+import math
+import os
+import queue
 import threading
 import time
+import tkinter as tk
 import traceback
 import win32com.client as com
+import win32con
+import win32gui
+import win32process
 
 # リボンに一覧として並べて表示する道路障害物の最大件数
 # （リボングループの表示領域には限りがあるため、収まる範囲に絞って表示する）
 MAX_DISPLAYED_OBSTRUCTIONS = 3
 
 # 障害物として配置する3Dモデルの名前(プロジェクトに存在することを確認済み)。
-# Pylonは回転対称な形状のため、向き(YawAngle)の設定は不要
-OBSTRUCTION_MODEL_NAME = 'Pylon'
+# Barricadeは回転対称ではないため、道路の進行方向に対して垂直(車線をふさぐ向き)に
+# なるようYawAngleを設定する(BARRICADE_YAW_OFFSET_RADIANS参照)
+OBSTRUCTION_MODEL_NAME = 'Barricade'
+
+# 道路の進行方向(road.GetDirectionAtから求めた角度)に対して、Barricadeをどれだけ
+# 回転させて配置するかのオフセット(ラジアン)を足すことで、道路の
+# 進行方向に対して垂直になり、車線をふさぐ向きになる
+BARRICADE_YAW_OFFSET_RADIANS = 0.2
+
+# CSVレコードの緯度経度に最も近い道路上の地点(中心)から、道路に沿って上流・下流
+# それぞれこの距離(m)だけずらした2箇所にBarricadeを1本ずつ配置する
+BARRICADE_OFFSET_DISTANCE_METERS = 5.0
 
 # APIのエントリポイント
 winRoadProxy = None
@@ -29,6 +47,11 @@ ribbon = None
 # 現在配置中の障害物のリスト(車線数だけ配置される)。各要素は {'instance':..., 'model':...}
 currentObstructions = []
 
+# List Obstructionsで最後に取得した、道路データ既存の道路障害物(F8RoadObstructionProxy)の
+# 一覧。Jump to Obstructionがインデックス指定で参照するため保持しておく。
+# 各要素は ListObstructions() が返すdict(road/roadName/description/distance/length)
+currentRoadObstructionItems = []
+
 # AddNewTransientで生成した直後の同フレームでPositionを設定すると、
 # ネイティブ側のオブジェクト初期化と競合してUC-win/Road自体がクラッシュすることが
 # あるため、生成と位置設定を分離する。生成直後はここに設定待ちの情報を積んでおき、
@@ -36,6 +59,63 @@ currentObstructions = []
 # (車線ごとに1個ずつ生成するため、複数件を同時に待たせられるようリストで持つ)
 PLACEMENT_SETTLE_TICKS = 20  # ループは5ms間隔なので、20ティック=約100ms待つ
 pendingObstructions = []
+
+# CSVタブで読み込んだ予測結果。パスと、レコード(dict: latitude/longitude/side_m/probability)の
+# リストを保持する。未読み込みならNone/空リスト
+loadedCsvPath = None
+loadedCsvRecords = []
+
+# --- 交通流計測(Traffic Monitor) ---
+# 配置済みBarricadeのうち、ユーザーが1件選んだものの位置を中心に、周辺の車両
+# (TransientCar)を定期的に取得して「平均速度」「流量(単位時間あたりの新規進入台数)」
+# を計測し、HUDに表示する。バリケード自体は見た目上のオブジェクトで交通AIに影響しない
+# ため、UC-win/Roadのエディタ上で同じ場所に手動で道路障害物(F8RoadObstructionProxy)を
+# 追加/削除しながら変化を確認する使い方を想定している。
+
+# HUD描画の間引き間隔(秒)。毎ティック(5ms)計測すると重いため、この間隔でのみ更新する
+TRAFFIC_METRICS_UPDATE_INTERVAL_SECONDS = 0.5
+
+# 計測中かどうか(Start/Stopボタンで切り替え)
+trafficMonitoring = False
+
+# 計測開始時にどのBarricadeを選んだか(currentObstructions内の並び順)。表示・ログ用に
+# 保持するだけで、計測そのものはmonitoredPosition(下記)という固定座標を使う。
+# 未選択(計測していない)場合はNone
+monitoredZoneIndex = None
+
+# 計測の基準となる固定座標(F8COMdVec3)。Start Monitoring時点でのBarricadeの位置を
+# コピーして保持する。バリケードは配置後に動かないため、Barricadeインスタンス自体を
+# 参照し続ける必要は無く、むしろResetでバリケードを削除しても同じ場所の計測を続けたい
+# というユーザー要望があるため、インスタンスではなく座標そのものを固定値として持つ設計
+# にしている。未選択(計測していない)場合はNone
+monitoredPosition = None
+
+# HUD用の独立ウィンドウ(main()で生成、HudOverlayWindowのインスタンス)。
+# UC-win/Roadのメイン3DビューへのOpenGL直接描画は2通り試して(OnOpenGLAfterDrawScene
+# への直接描画、2D Overlay Virtual DisplayのOnDirectDraw)いずれも実用にならなかった
+# ため(前者はGL_INVALID_OPERATIONが解消不能、後者はVirtual Display自体をUC-win/Road側
+# でどう作成するか不明で前提条件を満たせなかった)、Pythonの標準GUIであるtkinterで
+# 枠なし・最前面・背景透過のウィンドウを別途作り、UC-win/Roadのメインウィンドウの位置に
+# 追従させることで「画面に重ねて見える」ようにする方式に切り替えた
+hudOverlay = None
+
+# UC-win/Roadのメインウィンドウの位置取得を間引く間隔(秒)。GetWindowRectは軽い呼び出し
+# だが、毎ティック(5ms)呼ぶ必要はないため計測と同じ間隔で更新する
+HUD_POSITION_UPDATE_INTERVAL_SECONDS = 0.5
+lastHudPositionUpdateTime = 0.0
+
+# 直近の計測結果。{'index':, 'position':, 'vehicleCount':, 'avgSpeedKmh':,
+# 'flowVehPerHour':} のdict、または未計測ならNone。HUD/リボンの両方で参照する
+currentTrafficMetric = None
+
+# 選択中ゾーンの計測用の内部状態
+# previousVehicleIds: 直前の計測時にゾーン内にいた車両IDの集合(新規進入検出用)
+# flowEventTimestamps: 直近の計測ウィンドウ内で新規進入を検出した時刻のリスト
+previousVehicleIds = set()
+flowEventTimestamps = []
+
+# UpdateTrafficMetrics()の間引き用に前回更新時刻(time.time())を保持する
+lastTrafficMetricsUpdateTime = 0.0
 
 
 # UC-win/Roadのリボン(または Script Editor)の [Async] チェックがONのときだけ、
@@ -47,47 +127,74 @@ def IsRunningAsync():
     return threading.current_thread() is not threading.main_thread()
 
 
-# 現在のメインカメラの位置(ローカル座標)を緯度経度に変換して取得する
-# ローカル座標は X, Z が水平面、Y が高さなので、水平面変換には X, Z を使う
-def GetCameraLatLon():
-    mainCamera = winRoadProxy.MainForm.MainCamera
-    eye = mainCamera.MainCameraState.eye
-
-    srcVec2 = com.Dispatch('UCwinRoad.F8COMdVec2')
-    dstVec2 = com.Dispatch('UCwinRoad.F8COMdVec2')
-    convRes = com.Dispatch('UCwinRoad.F8COMHcsConvertResultType')
-    srcVec2.X = eye.X
-    srcVec2.Y = eye.Z
-
-    hConverter = winRoadProxy.CoordinateConverter.HorizontalCoordinateConvertor
-    hConverter.Convert(const._hcLocal_XY, const._hcWGS84_LonLat, srcVec2, dstVec2, convRes)
-
-    if not convRes.isSuccess:
-        logProxy.logger.error(
-            f"Coordinate conversion failed. isOutOfCS={convRes.isOutOfCS} isBadArray={convRes.isBadArray}")
+# Windowsのネイティブなファイルを開くダイアログを表示し、選択されたパスを返す
+# (キャンセル、またはダイアログ表示に失敗した場合はNone)。リボンにはファイル選択用の
+# 部品が無いため、ここだけpywin32のcommon dialogを直接使う
+def BrowseForCsvFile(initialDir):
+    try:
+        filename, _customFilter, _flags = win32gui.GetOpenFileNameW(
+            InitialDir=initialDir,
+            Filter='CSV Files\0*.csv\0All Files\0*.*\0\0',
+            Flags=win32con.OFN_EXPLORER | win32con.OFN_FILEMUSTEXIST | win32con.OFN_HIDEREADONLY,
+            Title='Select Prediction CSV',
+        )
+        return filename
+    except Exception:
+        # ユーザがキャンセルした場合もここに来る(pywintypes.error)。エラー扱いにはしない
         return None
 
-    # WGS84 LonLat は X=経度, Y=緯度
-    longitude = dstVec2.X
-    latitude = dstVec2.Y
-    return latitude, longitude
+
+# CSVファイルを読み込み、latitude/longitude/side_m/probabilityを持つdictのリストにする。
+# 値が数値に変換できない行は読み飛ばす
+def LoadCsvRecords(path):
+    records = []
+    with open(path, 'r', newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                records.append({
+                    'latitude': float(row['latitude']),
+                    'longitude': float(row['longitude']),
+                    'side_m': float(row.get('side_m', 0.0) or 0.0),
+                    'probability': float(row['probability']),
+                })
+            except (KeyError, ValueError, TypeError):
+                continue
+    return records
 
 
-class RibbonButtonHandlerGetCameraPosition(RibbonButtonHandler):
+class RibbonButtonHandlerBrowseCsv(RibbonButtonHandler):
     def OnClick(self):
+        global loadedCsvPath, loadedCsvRecords
         try:
-            result = GetCameraLatLon()
-            if result is None:
+            initialDir = winRoadProxy.PythonPluginDirectory() + 'Prediction'
+            if not os.path.isdir(initialDir):
+                initialDir = winRoadProxy.PythonPluginDirectory()
+            path = BrowseForCsvFile(initialDir)
+            if not path:
+                logProxy.logger.info('RibbonButtonHandlerBrowseCsv: cancelled, no file selected')
                 return
-            latitude, longitude = result
-            ribbon.edit_latitude.Text = str(latitude)
-            ribbon.edit_longitude.Text = str(longitude)
-            logProxy.logger.info(f"Camera position: lat={latitude}, lon={longitude}")
+
+            logProxy.logger.info(f'RibbonButtonHandlerBrowseCsv: loading {path}')
+            records = LoadCsvRecords(path)
+            loadedCsvPath = path
+            loadedCsvRecords = records
+            logProxy.logger.info(f'RibbonButtonHandlerBrowseCsv: loaded {len(records)} record(s)')
+
+            fileName = os.path.basename(path)
+            if not records:
+                summary = f"Loaded {fileName}: 0 records."
+            else:
+                probabilities = [r['probability'] for r in records]
+                summary = (
+                    f"Loaded {fileName}: {len(records)} records, "
+                    f"probability {min(probabilities):.4f}-{max(probabilities):.4f}")
+            ribbon.label_csv_summary.Caption = summary
         except Exception:
             logProxy.logger.error(traceback.format_exc())
 
 
-# 緯度経度をローカル座標(水平面 X, Z)に変換する(GetCameraLatLonの逆変換)
+# 緯度経度をローカル座標(水平面 X, Z)に変換する
 def LatLonToLocalXZ(latitude, longitude):
     srcVec2 = com.Dispatch('UCwinRoad.F8COMdVec2')
     dstVec2 = com.Dispatch('UCwinRoad.F8COMdVec2')
@@ -155,105 +262,164 @@ def FindNearestRoadPoint(x, z):
     return bestRoad, bestDistanceAlong
 
 
-# 入力欄の緯度経度から最も近い道路を探し、その地点にある車線のうち入力座標に最も
-# 近い車線1本の中央にのみ障害物(3Dモデル)を配置する。Pylonは回転対称な形状のため、
-# 向き(YawAngle)は設定しない(RoadLane.GetPositionにconst._ldRoadを渡すことで、
-# 道路側と同じdistanceAlongをそのまま使って各車線の中央位置が得られる。
-# Sample_GPSroads.pyのRoadLane走査パターンを踏襲)
-# 以前AddNewTransientでUC-win/Roadがクラッシュした際にログに何も残らなかったため、
-# 各COM呼び出しの前後で必ずログを残し、万一再発した際に原因箇所を特定できるようにする
-def PlaceObstruction():
-    logProxy.logger.info('PlaceObstruction: start')
-
-    latitude = float(ribbon.edit_latitude.Text)
-    longitude = float(ribbon.edit_longitude.Text)
-    logProxy.logger.info(f'PlaceObstruction: lat={latitude}, lon={longitude}')
-
+# 緯度経度1件分について、最も近い道路・車線を求め、その地点(中心)から道路に沿って
+# 上流・下流にBARRICADE_OFFSET_DISTANCE_METERSずつずらした2箇所の位置(F8COMdVec3)と
+# Barricadeの向き(YawAngle、ラジアン)を求める。見つからなければNone
+# (RoadLane.GetPositionにconst._ldRoadを渡すことで、道路側と同じdistanceAlongを
+# そのまま使って各車線上の位置が得られる。Sample_GPSroads.pyのRoadLane走査パターンを踏襲。
+# 向きはSample_RoadInformation.pyのroad.GetDirectionAt()と同じ式で道路方向の角度を求め、
+# BARRICADE_YAW_OFFSET_RADIANS分だけ回転させて車線をふさぐ向きにする)
+def FindNearestLanePosition(latitude, longitude):
+    """見つかった場合は (placements, distanceMeters) を返す。
+    placementsは [(下流側position, yawAngle), (上流側position, yawAngle)] の2件。
+    distanceMetersは入力座標から中心(道路上の最近傍点)までの水平距離で、CSVの点が
+    実際に道路の近くにあるかの判定に使う。道路自体が見つからない場合はNone"""
     local = LatLonToLocalXZ(latitude, longitude)
     if local is None:
-        logProxy.logger.error('PlaceObstruction: coordinate conversion failed, aborting')
-        return
+        return None
     x, z = local
-    logProxy.logger.info(f'PlaceObstruction: local x={x}, z={z}')
 
     found = FindNearestRoadPoint(x, z)
     if found is None:
-        logProxy.logger.error('PlaceObstruction: no road found in the project, aborting')
-        return
+        return None
     road, distanceAlong = found
-    logProxy.logger.info(f"PlaceObstruction: nearest road='{road.Name}' distance={distanceAlong:.1f}m")
-
-    model = FindThreeDModelByName(OBSTRUCTION_MODEL_NAME)
-    if model is None:
-        logProxy.logger.error(f"PlaceObstruction: model '{OBSTRUCTION_MODEL_NAME}' not found, aborting")
-        return
-    logProxy.logger.info(f"PlaceObstruction: using model '{model.Name}' (ModelType={model.ModelType})")
 
     laneCount = road.RoadLanesCount
     if laneCount <= 0:
-        logProxy.logger.error('PlaceObstruction: road has no lanes, aborting')
-        return
+        return None
 
-    # 各車線の中央位置を求め、入力座標(x, z)に最も近い車線1本だけを選ぶ
-    nearestPosition = None
+    nearestLane = None
     nearestSqDist = None
-    nearestLaneIndex = None
     for laneIndex in range(laneCount):
         lane = road.RoadLane(laneIndex)
         if lane is None:
             continue
         position = lane.GetPosition(distanceAlong, const._ldRoad)
         sqDist = (position.X - x) ** 2 + (position.Z - z) ** 2
-        logProxy.logger.info(
-            f'PlaceObstruction: lane[{laneIndex}] position=({position.X}, {position.Y}, {position.Z}) '
-            f'sqDist={sqDist:.2f}')
         if nearestSqDist is None or sqDist < nearestSqDist:
             nearestSqDist = sqDist
-            nearestPosition = position
-            nearestLaneIndex = laneIndex
+            nearestLane = lane
 
-    if nearestPosition is None:
-        logProxy.logger.error('PlaceObstruction: no usable lane found, aborting')
+    if nearestLane is None:
+        return None
+
+    # 中心(distanceAlong)から道路に沿って下流・上流にBARRICADE_OFFSET_DISTANCE_METERS
+    # ずらした2箇所の位置・向きを求める。道路の始点・終点をはみ出す場合は範囲内に丸める
+    placements = []
+    for offset in (BARRICADE_OFFSET_DISTANCE_METERS, -BARRICADE_OFFSET_DISTANCE_METERS):
+        targetDistance = max(0.0, min(road.Length, distanceAlong + offset))
+        position = nearestLane.GetPosition(targetDistance, const._ldRoad)
+        roadDirection = road.GetDirectionAt(targetDistance)
+        roadYaw = math.atan2(roadDirection.X, -roadDirection.Z)
+        yawAngle = roadYaw + BARRICADE_YAW_OFFSET_RADIANS
+        placements.append((position, yawAngle))
+
+    return placements, math.sqrt(nearestSqDist)
+
+
+# CSVタブで読み込み済みのレコードのうち、確率がしきい値以上のものについて、
+# それぞれ最も近い道路・車線の位置を中心に、道路に沿って下流・上流に
+# BARRICADE_OFFSET_DISTANCE_METERSずらした2箇所にBarricadeを1本ずつ(1レコードあたり
+# 計2本)配置する。既存の配置は複数件を個別に差分更新すると複雑になるため、
+# クリックのたびに全て作り直す。以前AddNewTransientでUC-win/Roadがクラッシュした際に
+# ログに何も残らなかったため、各COM呼び出しの前後で必ずログを残し、
+# 万一再発した際に原因箇所を特定できるようにする
+def PlaceBarricadesFromCsv():
+    logProxy.logger.info('PlaceBarricadesFromCsv: start')
+
+    if not loadedCsvRecords:
+        logProxy.logger.error('PlaceBarricadesFromCsv: no CSV loaded, aborting')
+        ribbon.label_barricades_summary.Caption = "No CSV loaded. Use the CSV tab first."
         return
-    logProxy.logger.info(f'PlaceObstruction: nearest lane is lane[{nearestLaneIndex}]')
-    placements = [nearestPosition]
+
+    try:
+        threshold = float(ribbon.edit_probability_threshold.Text)
+    except ValueError:
+        logProxy.logger.error('PlaceBarricadesFromCsv: invalid probability threshold, aborting')
+        ribbon.label_barricades_summary.Caption = "Invalid probability threshold."
+        return
+
+    try:
+        maxRoadDistance = float(ribbon.edit_max_road_distance.Text)
+    except ValueError:
+        logProxy.logger.error('PlaceBarricadesFromCsv: invalid max road distance, aborting')
+        ribbon.label_barricades_summary.Caption = "Invalid max distance to road."
+        return
+    logProxy.logger.info(f'PlaceBarricadesFromCsv: threshold={threshold} maxRoadDistance={maxRoadDistance}')
+
+    targetRecords = [r for r in loadedCsvRecords if r['probability'] >= threshold]
+    logProxy.logger.info(
+        f'PlaceBarricadesFromCsv: {len(targetRecords)}/{len(loadedCsvRecords)} record(s) meet the threshold')
+
+    model = FindThreeDModelByName(OBSTRUCTION_MODEL_NAME)
+    if model is None:
+        logProxy.logger.error(f"PlaceBarricadesFromCsv: model '{OBSTRUCTION_MODEL_NAME}' not found, aborting")
+        ribbon.label_barricades_summary.Caption = f"Model '{OBSTRUCTION_MODEL_NAME}' not found."
+        return
+
+    # CSVからの配置は毎回作り直す(個々のBarricadeを差分更新する仕組みは持たない)
+    ResetObstruction()
+
+    if not targetRecords:
+        ribbon.label_barricades_summary.Caption = f"0 record(s) >= threshold {threshold}."
+        return
+
+    # 道路が全く見つからない場合と、道路は見つかったが遠すぎて「道路上」とは
+    # 言えない場合を分けて数える(サマリー表示・ログ調査のため)
+    placements = []
+    skippedNoRoad = 0
+    skippedTooFar = 0
+    for record in targetRecords:
+        result = FindNearestLanePosition(record['latitude'], record['longitude'])
+        if result is None:
+            logProxy.logger.error(
+                f"PlaceBarricadesFromCsv: no usable road/lane for "
+                f"({record['latitude']}, {record['longitude']}), skipping")
+            skippedNoRoad += 1
+            continue
+        recordPlacements, distance = result
+        if distance > maxRoadDistance:
+            logProxy.logger.info(
+                f"PlaceBarricadesFromCsv: ({record['latitude']}, {record['longitude']}) is {distance:.1f}m "
+                f"from the nearest road (> {maxRoadDistance}m), skipping")
+            skippedTooFar += 1
+            continue
+        # 中心の前後2箇所(下流・上流)を両方とも配置対象に追加する
+        placements.extend(recordPlacements)
+
+    logProxy.logger.info(
+        f'PlaceBarricadesFromCsv: resolved {len(placements)} placement(s) '
+        f'(skipped {skippedNoRoad} no-road, {skippedTooFar} too-far)')
 
     global currentObstructions, pendingObstructions
+    traffic = winRoadProxy.SimulationCore.TrafficSimulation
+    newObstructions = []
+    newPending = []
+    for idx, (position, yawAngle) in enumerate(placements):
+        logProxy.logger.info(f'PlaceBarricadesFromCsv: [{idx}] calling AddNewTransient')
+        instance = traffic.AddNewTransient(model)
+        if instance is None:
+            logProxy.logger.error(f'PlaceBarricadesFromCsv: [{idx}] AddNewTransient returned None, skipping')
+            continue
+        newObstructions.append({'instance': instance, 'model': model})
+        # 生成直後は位置・向きを設定せず、メインループ側で数ティック後に設定する
+        # (同フレームでPosition/YawAngleを設定するとクラッシュにつながることがあるため)
+        newPending.append({
+            'instance': instance,
+            'position': position,
+            'yawAngle': yawAngle,
+            'ticksRemaining': PLACEMENT_SETTLE_TICKS,
+        })
 
-    # 既存の配置が車線数・モデルとも一致していれば、作り直さず位置だけ更新する
-    if (len(currentObstructions) == len(placements)
-            and all(o['model'].IsSameAs(model) for o in currentObstructions)):
-        logProxy.logger.info('PlaceObstruction: reusing existing instances, moving them')
-        for obstruction, position in zip(currentObstructions, placements):
-            obstruction['instance'].Position = position
-        winRoadProxy.MainForm.MainOpenGL.Changed()
-        logProxy.logger.info('PlaceObstruction: moved existing instances successfully')
-    else:
-        if currentObstructions:
-            logProxy.logger.info('PlaceObstruction: lane layout changed, removing previous instances first')
-            ResetObstruction()
-
-        traffic = winRoadProxy.SimulationCore.TrafficSimulation
-        newObstructions = []
-        newPending = []
-        for laneIndex, position in enumerate(placements):
-            logProxy.logger.info(f'PlaceObstruction: lane[{laneIndex}] calling AddNewTransient')
-            instance = traffic.AddNewTransient(model)
-            if instance is None:
-                logProxy.logger.error(f'PlaceObstruction: lane[{laneIndex}] AddNewTransient returned None, skipping')
-                continue
-            newObstructions.append({'instance': instance, 'model': model})
-            # 生成直後は位置を設定せず、メインループ側で数ティック後に設定する(上のコメント参照)
-            newPending.append({
-                'instance': instance,
-                'position': position,
-                'ticksRemaining': PLACEMENT_SETTLE_TICKS,
-            })
-
-        currentObstructions = newObstructions
-        pendingObstructions = newPending
-        logProxy.logger.info(
-            f'PlaceObstruction: {len(newObstructions)} instance(s) created, Position deferred to next ticks')
+    currentObstructions = newObstructions
+    pendingObstructions = newPending
+    logProxy.logger.info(
+        f'PlaceBarricadesFromCsv: {len(newObstructions)} Barricade(s) created, '
+        f'Position/YawAngle deferred to next ticks')
+    ribbon.label_barricades_summary.Caption = (
+        f"Placed {len(newObstructions)} Barricade(s) from {len(targetRecords)} record(s) "
+        f"(threshold={threshold}, max road dist={maxRoadDistance}m; "
+        f"skipped {skippedNoRoad} no-road, {skippedTooFar} too-far).")
 
 
 # メインループから毎ティック呼ばれる。生成直後で設定待ちの障害物があれば、
@@ -271,9 +437,10 @@ def ApplyPendingObstructions():
             remaining.append(pending)
             continue
         instance = pending['instance']
-        logProxy.logger.info('ApplyPendingObstructions: setting Position')
+        logProxy.logger.info('ApplyPendingObstructions: setting Position/YawAngle')
         instance.Position = pending['position']
-        logProxy.logger.info('ApplyPendingObstructions: Position set successfully')
+        instance.YawAngle = pending['yawAngle']
+        logProxy.logger.info('ApplyPendingObstructions: Position/YawAngle set successfully')
         appliedAny = True
     pendingObstructions = remaining
 
@@ -282,12 +449,284 @@ def ApplyPendingObstructions():
         logProxy.logger.info('ApplyPendingObstructions: done')
 
 
-# 設置中のPylonをすべてシミュレーションから削除する
+# UC-win/Roadのメインウィンドウに重ねて表示する、枠なし・最前面・背景透過のtkinter
+# ウィンドウ。メイン3DビューへのOpenGL直接描画を2通り試して(OnOpenGLAfterDrawScene
+# への直接描画、2D Overlay Virtual DisplayのOnDirectDraw)いずれも実用にならなかった
+# ため(前者は原因不明のGL_INVALID_OPERATIONが解消不能、後者はVirtual Display自体を
+# UC-win/Road側でどう作成するか分からず前提を満たせなかった)、Pythonの標準GUIである
+# tkinterで独立ウィンドウを別途作り、UC-win/Roadのメインウィンドウの位置に追従させる
+# ことで「画面に重ねて見える」ようにしている。
+#
+# tkinterはウィジェットを作成したスレッドで実際に mainloop() を回し続けている
+# ことを前提にしており、それ以外のスレッドから configure() 等を呼ぶと
+# 「RuntimeError: main thread is not in main loop」になる(実機で確認済み。
+# UC-win/RoadのPythonプラグインは[Async]チェックON時、メインスレッドとは別の
+# スレッドで動くため、そのままではこの制約に引っかかる)。そのためtkinter専用の
+# スレッドを新たに立て、Tkの生成からmainloop()の呼び出しまで全てそのスレッド内で
+# 完結させ、プラグイン側(メインループのスレッド)とはqueue.Queueだけでやり取りする
+class HudOverlayWindow:
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._readyEvent = threading.Event()
+        self._thread = threading.Thread(target=self._Run, daemon=True)
+        self._thread.start()
+        self._readyEvent.wait(timeout=5.0)
+
+    def _Run(self):
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)  # タイトルバー・枠を消す
+        self.root.attributes('-topmost', True)  # 常に最前面
+        self.root.configure(bg='#1a1a1a')
+        self.label = tk.Label(
+            self.root, text='', fg='#FFFF00', bg='#1a1a1a',
+            font=('Consolas', 18, 'bold'), justify='left', anchor='w')
+        self.label.pack(padx=14, pady=10)
+        self.root.geometry('+20+20')
+        self._readyEvent.set()
+        self._PollQueue()
+        self.root.mainloop()
+
+    # プラグイン側スレッドからqueueに積まれた指示を、tkinter自身のスレッド上で処理する。
+    # ウィジェット操作は必ずこのスレッド(root.after経由)からのみ行う
+    def _PollQueue(self):
+        try:
+            while True:
+                action, payload = self._queue.get_nowait()
+                if action == 'text':
+                    self.label.config(text=payload)
+                elif action == 'anchor':
+                    # メインウィンドウの矩形(left, top, right, bottom)を右下基準に
+                    # 配置する。ウィンドウ自身の現在のサイズ(フォント変更等で変わり
+                    # うる)をwinfo_width/heightで都度取得してから計算する
+                    left, top, right, bottom = payload
+                    self.root.update_idletasks()
+                    width = self.root.winfo_width()
+                    height = self.root.winfo_height()
+                    margin = 24
+                    x = right - width - margin
+                    y = bottom - height - margin
+                    self.root.geometry(f'+{int(x)}+{int(y)}')
+                elif action == 'destroy':
+                    self.root.quit()
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(50, self._PollQueue)
+
+    def SetText(self, text):
+        self._queue.put(('text', text))
+
+    # mainRectはメインウィンドウの(left, top, right, bottom)。この矩形の右下に
+    # 追従して自身を配置する
+    def SetAnchorRect(self, mainRect):
+        self._queue.put(('anchor', mainRect))
+
+    def Destroy(self):
+        self._queue.put(('destroy', None))
+        self._thread.join(timeout=2.0)
+
+
+# このプロセス(UC-win/Road自身。プラグインはUC-win/Roadのプロセス内で動作するため
+# os.getpid()が一致する)に属する可視ウィンドウのうち、最も面積が大きいものを
+# メインウィンドウとみなして返す。見つからなければNone
+def FindMainWindowHandle():
+    targetPid = os.getpid()
+    candidates = []
+
+    def _enumHandler(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if pid != targetPid:
+            return True
+        rect = win32gui.GetWindowRect(hwnd)
+        width = rect[2] - rect[0]
+        height = rect[3] - rect[1]
+        if width > 0 and height > 0:
+            candidates.append((hwnd, width * height))
+        return True
+
+    win32gui.EnumWindows(_enumHandler, None)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[1], reverse=True)
+    return candidates[0][0]
+
+
+# 計測開始時に固定した座標(monitoredPosition)の周辺(半径radius以内)の車両を
+# TrafficSimulation.GetTransientObjectsArroundで取得し、平均速度と流量(単位時間
+# あたりの新規進入台数)を計測する。メインループから毎ティック呼ばれるが、
+# 内部でTRAFFIC_METRICS_UPDATE_INTERVAL_SECONDSにより間引く(全車両走査は重いため)。
+# Barricadeインスタンス自体は参照しないため、Reset等でBarricadeが削除されても
+# 同じ場所での計測を継続できる
+def UpdateTrafficMetrics():
+    global lastTrafficMetricsUpdateTime, currentTrafficMetric, previousVehicleIds, flowEventTimestamps
+
+    if not trafficMonitoring or monitoredPosition is None:
+        return
+
+    now = time.time()
+    if now - lastTrafficMetricsUpdateTime < TRAFFIC_METRICS_UPDATE_INTERVAL_SECONDS:
+        return
+    lastTrafficMetricsUpdateTime = now
+
+    try:
+        radius = float(ribbon.edit_measurement_radius.Text)
+    except ValueError:
+        radius = 50.0
+    try:
+        flowWindowSeconds = float(ribbon.edit_flow_window.Text)
+    except ValueError:
+        flowWindowSeconds = 60.0
+    if flowWindowSeconds <= 0:
+        flowWindowSeconds = 60.0
+
+    traffic = winRoadProxy.SimulationCore.TrafficSimulation
+    position = monitoredPosition
+    trafficList = traffic.GetTransientObjectsArround(radius, position)
+    count = trafficList.Count
+
+    currentVehicleIds = set()
+    speeds = []
+    for i in range(count):
+        obj = trafficList.Items(i)
+        if obj is None:
+            continue
+        if obj.TransientType != const._TransientCar:
+            continue
+        currentVehicleIds.add(obj.ID)
+        speeds.append(obj.Speed(const._KiloMeterPerHour))
+
+    # 前回はゾーン内になく、今回初めてゾーン内に現れた車両を「新規進入」として
+    # 流量カウントの対象にする(既にゾーン内に留まっている車両は数えない)
+    newlyEnteredIds = currentVehicleIds - previousVehicleIds
+    previousVehicleIds = currentVehicleIds
+
+    flowEventTimestamps.extend([now] * len(newlyEnteredIds))
+    cutoff = now - flowWindowSeconds
+    flowEventTimestamps = [t for t in flowEventTimestamps if t >= cutoff]
+
+    avgSpeedKmh = sum(speeds) / len(speeds) if speeds else 0.0
+    # 直近flowWindowSeconds間の新規進入台数を1時間あたりの台数に換算する
+    flowVehPerHour = len(flowEventTimestamps) / flowWindowSeconds * 3600.0
+
+    currentTrafficMetric = {
+        'index': monitoredZoneIndex,
+        'position': position,
+        'vehicleCount': len(currentVehicleIds),
+        'avgSpeedKmh': avgSpeedKmh,
+        'flowVehPerHour': flowVehPerHour,
+    }
+    if ribbon is not None:
+        ribbon.ShowTrafficMetrics(currentTrafficMetric)
+    if hudOverlay is not None:
+        hudOverlay.SetText(
+            f"Barricade[{monitoredZoneIndex}]\n"
+            f"Flow: {flowVehPerHour:.0f} veh/h\n"
+            f"Avg Speed: {avgSpeedKmh:.1f} km/h\n"
+            f"Vehicles: {len(currentVehicleIds)}")
+
+
+# HUDオーバーレイウィンドウの位置をUC-win/Roadのメインウィンドウに追従させる。
+# tkinter自身のイベントループは専用スレッド側で回っているため、ここではqueue経由で
+# 新しい位置を指示するだけでよい。メインループから毎ティック呼ばれるが、内部で
+# HUD_POSITION_UPDATE_INTERVAL_SECONDSにより間引く(GetWindowRectは軽いが不要)
+def PumpHudOverlay():
+    global lastHudPositionUpdateTime
+    if hudOverlay is None:
+        return
+
+    now = time.time()
+    if now - lastHudPositionUpdateTime < HUD_POSITION_UPDATE_INTERVAL_SECONDS:
+        return
+    lastHudPositionUpdateTime = now
+
+    mainHwnd = FindMainWindowHandle()
+    if mainHwnd is not None:
+        rect = win32gui.GetWindowRect(mainHwnd)
+        hudOverlay.SetAnchorRect(rect)
+
+
+# 選択中ゾーンの計測状態(前回検出した車両ID集合・流量カウント用タイムスタンプ・直近の
+# 計測結果)を初期化する。計測対象の切り替え(Start)や、Barricadeの再配置
+# (ResetObstruction)のタイミングで呼ぶ
+def ResetTrafficMetricsState():
+    global previousVehicleIds, flowEventTimestamps, lastTrafficMetricsUpdateTime, currentTrafficMetric
+    previousVehicleIds = set()
+    flowEventTimestamps = []
+    lastTrafficMetricsUpdateTime = 0.0
+    currentTrafficMetric = None
+
+
+class RibbonButtonHandlerStartTrafficMonitoring(RibbonButtonHandler):
+    def OnClick(self):
+        global trafficMonitoring, monitoredZoneIndex, monitoredPosition, hudOverlay
+        try:
+            if trafficMonitoring:
+                return
+            if not currentObstructions:
+                ribbon.label_traffic_monitor_summary.Caption = (
+                    "No Barricade placed. Place Barricades from CSV first.")
+                return
+            try:
+                index = int(ribbon.edit_zone_index.Text)
+            except ValueError:
+                ribbon.label_traffic_monitor_summary.Caption = "Invalid Barricade index."
+                return
+            if index < 0 or index >= len(currentObstructions):
+                ribbon.label_traffic_monitor_summary.Caption = (
+                    f"Index {index} out of range (0-{len(currentObstructions) - 1}).")
+                return
+
+            monitoredZoneIndex = index
+            # この時点のBarricadeの位置を固定座標としてコピーする。以降はBarricade
+            # インスタンス自体を参照しないため、Reset等でBarricadeが削除されても
+            # 同じ場所での計測を継続できる(ユーザー要望)
+            monitoredPosition = currentObstructions[index]['instance'].Position
+            ResetTrafficMetricsState()
+
+            if hudOverlay is None:
+                hudOverlay = HudOverlayWindow()
+
+            trafficMonitoring = True
+            logProxy.logger.info(
+                f'RibbonButtonHandlerStartTrafficMonitoring: monitoring started for index {index} '
+                f'at fixed position ({monitoredPosition.X:.1f}, {monitoredPosition.Y:.1f}, '
+                f'{monitoredPosition.Z:.1f})')
+            ribbon.label_traffic_monitor_summary.Caption = f"Monitoring Barricade[{index}]..."
+        except Exception:
+            logProxy.logger.error(traceback.format_exc())
+
+
+class RibbonButtonHandlerStopTrafficMonitoring(RibbonButtonHandler):
+    def OnClick(self):
+        global trafficMonitoring, monitoredZoneIndex, monitoredPosition, currentTrafficMetric, hudOverlay
+        try:
+            trafficMonitoring = False
+            monitoredZoneIndex = None
+            monitoredPosition = None
+            currentTrafficMetric = None
+            if hudOverlay is not None:
+                hudOverlay.Destroy()
+                hudOverlay = None
+            if ribbon is not None:
+                ribbon.label_traffic_monitor_summary.Caption = "Monitoring stopped."
+                ribbon.ShowTrafficMetrics(None)
+            logProxy.logger.info('RibbonButtonHandlerStopTrafficMonitoring: monitoring stopped')
+        except Exception:
+            logProxy.logger.error(traceback.format_exc())
+
+
+# 設置中のBarricadeをすべてシミュレーションから削除する。交通流計測(Traffic Monitor)
+# はBarricadeインスタンスではなく固定座標(monitoredPosition)を基準に動作するため、
+# ここでBarricadeを消しても計測は意図的に止めない(同じ場所での計測を継続したいという
+# ユーザー要望による)
 def ResetObstruction():
     global currentObstructions, pendingObstructions
     # 設定待ちのまま削除すると、後でApplyPendingObstructionsが削除済みインスタンスに
     # Positionを設定しようとしてしまうため、先に取り消しておく
     pendingObstructions = []
+
     if not currentObstructions:
         logProxy.logger.info('ResetObstruction: nothing to remove')
         return
@@ -301,7 +740,7 @@ def ResetObstruction():
 
 # プロジェクト内の全ての一時オブジェクト(Transient)を無条件に削除する。
 # このスクリプトは実行のたびにcurrentObstructions等をNoneでリセットするため、
-# 過去の実行がクラッシュ等で正常終了しなかった場合、その回で配置したPylonが
+# 過去の実行がクラッシュ等で正常終了しなかった場合、その回で配置したBarricadeが
 # 道路上に残ったまま追跡できなくなることがある。それらの残骸を一掃するための
 # 強制リセット用ボタン(このスクリプトが把握していないオブジェクトも含め、プロジェクト内の
 # 一時オブジェクトを全て削除するため、通常の走行中の交通車両にも影響しうる点に注意)
@@ -317,45 +756,61 @@ def ClearAllTransientObjects():
     pendingObstructions = []
 
 
-# 現在スクリプトが認識している配置済みバリケードの情報を、実際にUC-win/Road側の
-# インスタンスから読み直して一覧にする(こちらで保持している値ではなく、都度
-# instance.Position等を読み直すことで、本当にシーンに存在しているかを確認できる)
-def ListPlacedBarricades():
-    items = []
-    for obstruction in currentObstructions:
-        instance = obstruction['instance']
-        instanceId = instance.ID
-        name = instance.Name
-        position = instance.Position
-        items.append((instanceId, name, position.X, position.Y, position.Z))
+# 配置済みのBarricadeのうちindex番目(0始まり、currentObstructionsの順)の位置へ
+# メインカメラを移動させる。見つからなければNone、見つかればそのPositionを返す。
+# 使い方はSamplePlugin/Sample_MainCameraOperation.pyのカメラ設定パターンを踏襲
+def JumpToBarricade(index):
+    if index < 0 or index >= len(currentObstructions):
+        return None
+    instance = currentObstructions[index]['instance']
+    position = instance.Position
+    yawAngle = instance.YawAngle
 
-    logProxy.logger.info(f"Found {len(items)} placed obstruction(s).")
-    for instanceId, name, x, y, z in items:
-        logProxy.logger.info(f"  ID={instanceId} Name={name} Position=({x}, {y}, {z})")
+    # Barricadeの向き(YawAngle = roadYaw + BARRICADE_YAW_OFFSET_RADIANS)から
+    # 道路の進行方向を逆算し、その進行方向の手前・上空から見下ろす形にする
+    roadYaw = yawAngle - BARRICADE_YAW_OFFSET_RADIANS
+    dirX = math.sin(roadYaw)
+    dirZ = -math.cos(roadYaw)
 
-    return items
+    camState = com.Dispatch('UCwinRoad.F8COMMainCameraStateType')
+    camState.allowUnderTerrain = True
+    camState.cameraMode = const._useTiltAng
+    camState.eye = AsF8COMdVec3(position.X - dirX * 20.0, position.Y + 15.0, position.Z - dirZ * 20.0)
+    camState.ViewPoint = AsF8COMdVec3(position.X, position.Y, position.Z)
+    camState.tiltAngle = 0
+    winRoadProxy.MainForm.MainCamera.MainCameraState = camState
+    return position
 
 
-class RibbonButtonHandlerListBarricades(RibbonButtonHandler):
+class RibbonButtonHandlerJumpToBarricade(RibbonButtonHandler):
     def OnClick(self):
         try:
-            items = ListPlacedBarricades()
-            if not items:
-                summary = "Nothing placed."
-            else:
-                instanceId, name, x, y, z = items[0]
-                summary = (
-                    f"{len(items)} placed. First: ID={instanceId} Name={name} "
-                    f"Pos=({x:.1f}, {y:.1f}, {z:.1f})")
-            ribbon.label_barricade_summary.Caption = summary
+            if not currentObstructions:
+                ribbon.label_jump_summary.Caption = "Nothing placed."
+                return
+            try:
+                index = int(ribbon.edit_jump_index.Text)
+            except ValueError:
+                ribbon.label_jump_summary.Caption = "Invalid Barricade index."
+                return
+            position = JumpToBarricade(index)
+            if position is None:
+                ribbon.label_jump_summary.Caption = (
+                    f"Index {index} out of range (0-{len(currentObstructions) - 1}).")
+                return
+            logProxy.logger.info(
+                f'RibbonButtonHandlerJumpToBarricade: jumped to index {index} '
+                f'Pos=({position.X}, {position.Y}, {position.Z})')
+            ribbon.label_jump_summary.Caption = (
+                f"Jumped to Barricade[{index}] at ({position.X:.1f}, {position.Y:.1f}, {position.Z:.1f}).")
         except Exception:
             logProxy.logger.error(traceback.format_exc())
 
 
-class RibbonButtonHandlerPlaceObstruction(RibbonButtonHandler):
+class RibbonButtonHandlerPlaceBarricadesFromCsv(RibbonButtonHandler):
     def OnClick(self):
         try:
-            PlaceObstruction()
+            PlaceBarricadesFromCsv()
         except Exception:
             logProxy.logger.error(traceback.format_exc())
 
@@ -377,13 +832,14 @@ class RibbonButtonHandlerClearAll(RibbonButtonHandler):
 
 
 # プロジェクト内の全道路が持つ道路障害物(F8RoadObstructionProxy)を一覧取得する
-# 戻り値は (road.Name, description, distance, length) のタプルのリスト
+# 戻り値は dict(road, roadName, description, distance, length) のリスト。
+# roadとdistanceは、後でJumpToRoadObstruction()が位置(road.GetPositionAt(distance))を
+# 求めるために保持しておく(F8RoadObstructionProxy自体はPositionを持たない読み取り専用データ)
 def ListObstructions():
     prj = winRoadProxy.Project
     roadCount = prj.RoadsCount
 
     items = []
-    inspected = False
     for i in range(roadCount):
         road = prj.Road(i)
         if road is None:
@@ -393,31 +849,19 @@ def ListObstructions():
             obstruction = road.Obstruction(j)
             if obstruction is None:
                 continue
-
-            # 診断用(テスト): 最初に見つかった道路障害物オブジェクトについて、
-            # dir()/type()等でPython側から実際にどう見えているかをログに残す。
-            # 静的なtypelib走査では読み取り専用としか分からなかったため、
-            # 実物のCOMオブジェクトを取得した際に何か違いがないか確認する
-            if not inspected:
-                try:
-                    logProxy.logger.info(f'ListObstructions: inspecting obstruction object')
-                    logProxy.logger.info(f'ListObstructions: type={type(obstruction)!r}')
-                    logProxy.logger.info(f'ListObstructions: dir={dir(obstruction)!r}')
-                    logProxy.logger.info(f'ListObstructions: mro={type(obstruction).__mro__!r}')
-                    getMap = getattr(obstruction, '_prop_map_get_', None)
-                    putMap = getattr(obstruction, '_prop_map_put_', None)
-                    logProxy.logger.info(f'ListObstructions: _prop_map_get_={getMap!r}')
-                    logProxy.logger.info(f'ListObstructions: _prop_map_put_={putMap!r}')
-                except Exception:
-                    logProxy.logger.error('ListObstructions: inspection failed:\n' + traceback.format_exc())
-                inspected = True
-
-            items.append((road.Name, obstruction.Description, obstruction.Distance, obstruction.Length))
+            items.append({
+                'road': road,
+                'roadName': road.Name,
+                'description': obstruction.Description,
+                'distance': obstruction.Distance,
+                'length': obstruction.Length,
+            })
 
     logProxy.logger.info(f"Found {len(items)} obstruction(s).")
-    for roadName, description, distance, length in items:
+    for item in items:
         logProxy.logger.info(
-            f"  {roadName} @ {distance:.1f}m: {description} (Length={length:.1f}m)")
+            f"  {item['roadName']} @ {item['distance']:.1f}m: {item['description']} "
+            f"(Length={item['length']:.1f}m)")
 
     return items
 
@@ -425,8 +869,56 @@ def ListObstructions():
 class RibbonButtonHandlerListObstructions(RibbonButtonHandler):
     def OnClick(self):
         try:
-            items = ListObstructions()
-            ribbon.ShowObstructionList(items)
+            global currentRoadObstructionItems
+            currentRoadObstructionItems = ListObstructions()
+            ribbon.ShowObstructionList(currentRoadObstructionItems)
+        except Exception:
+            logProxy.logger.error(traceback.format_exc())
+
+
+# List Obstructionsで取得した道路障害物のうちindex番目(0始まり)の位置へ
+# メインカメラを移動させる。F8RoadObstructionProxyはPositionを持たないため、
+# road.GetPositionAt(distance)で道路中心線上の位置を求めて代用する。
+# 見つからなければNone、見つかればそのPositionを返す
+def JumpToRoadObstruction(index):
+    if index < 0 or index >= len(currentRoadObstructionItems):
+        return None
+    item = currentRoadObstructionItems[index]
+    position = item['road'].GetPositionAt(item['distance'])
+
+    camState = com.Dispatch('UCwinRoad.F8COMMainCameraStateType')
+    camState.allowUnderTerrain = True
+    camState.cameraMode = const._useTiltAng
+    # 道路障害物には向きの情報が無いため、Pylon時代と同様、固定オフセットで見下ろす
+    camState.eye = AsF8COMdVec3(position.X, position.Y + 15.0, position.Z - 20.0)
+    camState.ViewPoint = AsF8COMdVec3(position.X, position.Y, position.Z)
+    camState.tiltAngle = 0
+    winRoadProxy.MainForm.MainCamera.MainCameraState = camState
+    return position
+
+
+class RibbonButtonHandlerJumpToRoadObstruction(RibbonButtonHandler):
+    def OnClick(self):
+        try:
+            if not currentRoadObstructionItems:
+                ribbon.label_obstruction_jump_summary.Caption = "Nothing listed. Use List Obstructions first."
+                return
+            try:
+                index = int(ribbon.edit_obstruction_jump_index.Text)
+            except ValueError:
+                ribbon.label_obstruction_jump_summary.Caption = "Invalid obstruction index."
+                return
+            position = JumpToRoadObstruction(index)
+            if position is None:
+                ribbon.label_obstruction_jump_summary.Caption = (
+                    f"Index {index} out of range (0-{len(currentRoadObstructionItems) - 1}).")
+                return
+            logProxy.logger.info(
+                f'RibbonButtonHandlerJumpToRoadObstruction: jumped to index {index} '
+                f'Pos=({position.X}, {position.Y}, {position.Z})')
+            ribbon.label_obstruction_jump_summary.Caption = (
+                f"Jumped to Obstruction[{index}] at "
+                f"({position.X:.1f}, {position.Y:.1f}, {position.Z:.1f}).")
         except Exception:
             logProxy.logger.error(traceback.format_exc())
 
@@ -449,25 +941,33 @@ class RibbonUI:
     def __init__(self):
         self.ribbonMenu = None
 
-        # Position タブ: 緯度経度の入力とカメラ位置取得
+        # CSV タブ: Predictionフォルダ内のCSVファイルの選択・読み込み
         # (1タブに機能を詰め込むとリボンの横幅が足りず正しく表示されなかったため、
         #  機能ごとにタブを分けている。各タブにはグループを1つだけ置く)
-        self.tabPosition = None
-        self.groupPosition = None
-        self.label_latitude = None
-        self.edit_latitude = None
-        self.label_longitude = None
-        self.edit_longitude = None
-        self.button_get_camera_position = None
+        self.tabCsv = None
+        self.groupCsv = None
+        self.button_browse_csv = None
+        self.label_csv_summary = None
 
-        # Placement タブ: 障害物の設置・解除・確認
-        self.tabPlacement = None
-        self.groupPlacement = None
-        self.button_place_obstruction = None
+        # Barricades タブ: CSVレコードに基づく障害物の設置・確認
+        self.tabBarricades = None
+        self.groupBarricades = None
+        self.label_probability_threshold = None
+        self.edit_probability_threshold = None
+        self.label_max_road_distance = None
+        self.edit_max_road_distance = None
+        self.button_place_barricades = None
+        self.label_barricades_summary = None
+        self.label_jump_index = None
+        self.edit_jump_index = None
+        self.button_jump_to_barricade = None
+        self.label_jump_summary = None
+
+        # Reset タブ: 配置済みBarricadeの解除・強制リセット
+        self.tabReset = None
+        self.groupReset = None
         self.button_reset_obstruction = None
         self.button_clear_all = None
-        self.button_list_barricades = None
-        self.label_barricade_summary = None
 
         # Obstructions タブ: 道路に既存の道路障害物の一覧
         self.tabObstructions = None
@@ -476,6 +976,25 @@ class RibbonUI:
         self.panel_obstructions = None
         self.label_obstruction_summary = None
         self.obstructionItemLabels = []
+        self.label_obstruction_jump_index = None
+        self.edit_obstruction_jump_index = None
+        self.button_jump_to_obstruction = None
+        self.label_obstruction_jump_summary = None
+
+        # Traffic Monitor タブ: 選択した1件のBarricade周辺の交通流(流量・平均速度)の
+        # 計測とHUD表示
+        self.tabTrafficMonitor = None
+        self.groupTrafficMonitor = None
+        self.label_zone_index = None
+        self.edit_zone_index = None
+        self.label_measurement_radius = None
+        self.edit_measurement_radius = None
+        self.label_flow_window = None
+        self.edit_flow_window = None
+        self.button_start_traffic_monitoring = None
+        self.button_stop_traffic_monitoring = None
+        self.label_traffic_monitor_summary = None
+        self.edit_traffic_monitor_detail = None
 
         self.EventList = []
 
@@ -563,62 +1082,96 @@ class RibbonUI:
 
         for idx, label in enumerate(self.obstructionItemLabels):
             if idx < len(shown):
-                roadName, description, distance, length = shown[idx]
-                label.Caption = f"{roadName} @ {distance:.1f}m: {description} (L={length:.1f}m)"
+                item = shown[idx]
+                label.Caption = (
+                    f"{item['roadName']} @ {item['distance']:.1f}m: "
+                    f"{item['description']} (L={item['length']:.1f}m)")
                 label.Visible = True
             else:
                 label.Caption = ''
                 label.Visible = False
 
+    # 選択中1件の計測結果をリボンに表示する(HUDが見えない/未確認の場合の
+    # フォールバックも兼ねる)。metricsがNoneなら詳細行を空にする
+    # (label_traffic_monitor_summaryの方は呼び出し元がその時点の状況、例:
+    # "Monitoring stopped."を先にCaption設定済みなので、ここでは上書きしない)
+    def ShowTrafficMetrics(self, metrics):
+        if metrics is None:
+            self.edit_traffic_monitor_detail.Text = ''
+            return
+        self.edit_traffic_monitor_detail.Text = (
+            f"Barricade Index: {metrics['index']}\r\n"
+            f"Flow: {metrics['flowVehPerHour']:.0f} veh/h\r\n"
+            f"Avg Speed: {metrics['avgSpeedKmh']:.1f} km/h\r\n"
+            f"Vehicles in Zone: {metrics['vehicleCount']}")
+
     def MakeRibbonUI(self):
         mainForm = winRoadProxy.MainForm
         self.ribbonMenu = mainForm.MainRibbonMenu
 
-        # === Position タブ: 緯度経度の入力とカメラ位置取得 ===
-        self.tabPosition = self.MakeRibbonTab(self.ribbonMenu, 'RoadBlockagePluginPosition', 'Road Blockage: Position')
-        self.groupPosition = self.MakeRibbonGroup(self.tabPosition, 'GroupPosition', 'Position')
+        # === CSV タブ: Predictionフォルダ内のCSVファイルの選択・読み込み ===
+        self.tabCsv = self.MakeRibbonTab(self.ribbonMenu, 'RoadBlockagePluginCsv', 'Road Blockage: CSV')
+        self.groupCsv = self.MakeRibbonGroup(self.tabCsv, 'GroupCsv', 'CSV')
 
-        self.label_latitude = self.MakeRibbonLabel(self.groupPosition, 'LabelLatitude', 'Latitude')
-        self.edit_latitude = self.MakeRibbonEdit(self.groupPosition, 'EditLatitude', '')
+        self.button_browse_csv = self.MakeRibbonButton(
+            self.groupCsv, 'ButtonBrowseCsv', 'Browse & Load CSV...', RibbonButtonHandlerBrowseCsv)
+        self.button_browse_csv.Width = 160
 
-        self.label_longitude = self.MakeRibbonLabel(self.groupPosition, 'LabelLongitude', 'Longitude')
-        self.edit_longitude = self.MakeRibbonEdit(self.groupPosition, 'EditLongitude', '')
+        self.label_csv_summary = self.MakeRibbonLabel(self.groupCsv, 'LabelCsvSummary', 'No CSV loaded.')
+        self.label_csv_summary.Width = 420
 
-        self.button_get_camera_position = self.MakeRibbonButton(
-            self.groupPosition, 'ButtonGetCameraPosition', 'Get Camera Position',
-            RibbonButtonHandlerGetCameraPosition)
-        # デフォルト幅だとキャプションが収まらないため広げる
-        self.button_get_camera_position.Width = 160
+        # === Barricades タブ: CSVレコードに基づく障害物の設置・確認 ===
+        self.tabBarricades = self.MakeRibbonTab(
+            self.ribbonMenu, 'RoadBlockagePluginBarricades', 'Road Blockage: Barricades')
+        self.groupBarricades = self.MakeRibbonGroup(self.tabBarricades, 'GroupBarricades', 'Barricades')
 
-        # === Placement タブ: 障害物の設置・解除・確認 ===
-        self.tabPlacement = self.MakeRibbonTab(
-            self.ribbonMenu, 'RoadBlockagePluginPlacement', 'Road Blockage: Placement')
-        self.groupPlacement = self.MakeRibbonGroup(self.tabPlacement, 'GroupPlacement', 'Placement')
+        # 確率(Probability)がこの値以上のCSVレコードだけを配置対象にする
+        self.label_probability_threshold = self.MakeRibbonLabel(
+            self.groupBarricades, 'LabelProbabilityThreshold', 'Probability Threshold')
+        self.edit_probability_threshold = self.MakeRibbonEdit(
+            self.groupBarricades, 'EditProbabilityThreshold', '0.7')
 
-        self.button_place_obstruction = self.MakeRibbonButton(
-            self.groupPlacement, 'ButtonPlaceObstruction', 'Place Obstruction',
-            RibbonButtonHandlerPlaceObstruction)
-        self.button_place_obstruction.Width = 160
+        # 最も近い道路までの距離がこの値(m)を超える場合は「道路上に無い」とみなして
+        # 配置しない(CSVはグリッド状の予測点のため、道路から大きく離れた点も含まれるため)
+        self.label_max_road_distance = self.MakeRibbonLabel(
+            self.groupBarricades, 'LabelMaxRoadDistance', 'Max Distance to Road (m)')
+        self.edit_max_road_distance = self.MakeRibbonEdit(
+            self.groupBarricades, 'EditMaxRoadDistance', '5000')
+
+        self.button_place_barricades = self.MakeRibbonButton(
+            self.groupBarricades, 'ButtonPlaceBarricades', 'Place Barricades from CSV',
+            RibbonButtonHandlerPlaceBarricadesFromCsv)
+        self.button_place_barricades.Width = 160
+
+        self.label_barricades_summary = self.MakeRibbonLabel(self.groupBarricades, 'LabelBarricadesSummary', '')
+        self.label_barricades_summary.Width = 420
+
+        # 配置したBarricadeの場所がわかりにくいため、指定したインデックスのBarricadeへ
+        # メインカメラをジャンプさせて見た目を確認できるようにする
+        self.label_jump_index = self.MakeRibbonLabel(self.groupBarricades, 'LabelJumpIndex', 'Barricade Index')
+        self.edit_jump_index = self.MakeRibbonEdit(self.groupBarricades, 'EditJumpIndex', '0')
+
+        self.button_jump_to_barricade = self.MakeRibbonButton(
+            self.groupBarricades, 'ButtonJumpToBarricade', 'Jump to Barricade', RibbonButtonHandlerJumpToBarricade)
+        self.button_jump_to_barricade.Width = 160
+
+        self.label_jump_summary = self.MakeRibbonLabel(self.groupBarricades, 'LabelJumpSummary', '')
+        self.label_jump_summary.Width = 420
+
+        # === Reset タブ: 配置済みBarricadeの解除・強制リセット ===
+        self.tabReset = self.MakeRibbonTab(
+            self.ribbonMenu, 'RoadBlockagePluginReset', 'Road Blockage: Reset')
+        self.groupReset = self.MakeRibbonGroup(self.tabReset, 'GroupReset', 'Reset')
 
         self.button_reset_obstruction = self.MakeRibbonButton(
-            self.groupPlacement, 'ButtonResetObstruction', 'Reset', RibbonButtonHandlerResetObstruction)
+            self.groupReset, 'ButtonResetObstruction', 'Reset', RibbonButtonHandlerResetObstruction)
         self.button_reset_obstruction.Width = 160
 
         # 過去の実行がクラッシュ等で正常終了せず、道路上に残ってしまった一時オブジェクトを
         # 一掃するための強制リセット。通常の走行中の交通車両にも影響しうる点に注意
         self.button_clear_all = self.MakeRibbonButton(
-            self.groupPlacement, 'ButtonClearAll', 'Clear All', RibbonButtonHandlerClearAll)
+            self.groupReset, 'ButtonClearAll', 'Clear All', RibbonButtonHandlerClearAll)
         self.button_clear_all.Width = 160
-
-        # 配置中のオブジェクトをUC-win/Road側から読み直して確認するボタン
-        # (見た目に表示されない問題の切り分け用。本当にシーンに存在するかを確認する)
-        self.button_list_barricades = self.MakeRibbonButton(
-            self.groupPlacement, 'ButtonListBarricades', 'List Placed', RibbonButtonHandlerListBarricades)
-        self.button_list_barricades.Width = 160
-
-        self.label_barricade_summary = self.MakeRibbonLabel(
-            self.groupPlacement, 'LabelBarricadeSummary', '')
-        self.label_barricade_summary.Width = 420
 
         # === Obstructions タブ: 道路に既存の道路障害物の一覧 ===
         self.tabObstructions = self.MakeRibbonTab(
@@ -651,10 +1204,103 @@ class RibbonUI:
             label.Visible = False
             self.obstructionItemLabels.append(label)
 
+        # 一覧の中からindexで指定した1件へメインカメラをジャンプさせて確認できるようにする
+        # (F8RoadObstructionProxyはPosition自体は持たないため、road.GetPositionAtで代用する)
+        self.label_obstruction_jump_index = self.MakeRibbonLabel(
+            self.groupObstructions, 'LabelObstructionJumpIndex', 'Obstruction Index')
+        self.edit_obstruction_jump_index = self.MakeRibbonEdit(
+            self.groupObstructions, 'EditObstructionJumpIndex', '0')
+
+        self.button_jump_to_obstruction = self.MakeRibbonButton(
+            self.groupObstructions, 'ButtonJumpToObstruction', 'Jump to Obstruction',
+            RibbonButtonHandlerJumpToRoadObstruction)
+        self.button_jump_to_obstruction.Width = 160
+
+        self.label_obstruction_jump_summary = self.MakeRibbonLabel(
+            self.groupObstructions, 'LabelObstructionJumpSummary', '')
+        self.label_obstruction_jump_summary.Width = 420
+
+        # === Traffic Monitor タブ: 選択した1件のBarricade周辺の交通流計測・HUD表示 ===
+        self.tabTrafficMonitor = self.MakeRibbonTab(
+            self.ribbonMenu, 'RoadBlockagePluginTrafficMonitor', 'Road Blockage: Traffic Monitor')
+        self.groupTrafficMonitor = self.MakeRibbonGroup(
+            self.tabTrafficMonitor, 'GroupTrafficMonitor', 'Traffic Monitor')
+
+        # 計測対象とするBarricadeをインデックスで1件選ぶ(currentObstructionsの順)
+        self.label_zone_index = self.MakeRibbonLabel(
+            self.groupTrafficMonitor, 'LabelZoneIndex', 'Barricade Index')
+        self.edit_zone_index = self.MakeRibbonEdit(self.groupTrafficMonitor, 'EditZoneIndex', '0')
+
+        # 選んだBarricadeの位置からこの半径(m)以内にいる車両を計測対象にする
+        self.label_measurement_radius = self.MakeRibbonLabel(
+            self.groupTrafficMonitor, 'LabelMeasurementRadius', 'Measurement Radius (m)')
+        self.edit_measurement_radius = self.MakeRibbonEdit(
+            self.groupTrafficMonitor, 'EditMeasurementRadius', '50')
+
+        # 流量(単位時間あたりの新規進入台数)を計算する際の移動集計ウィンドウ(秒)
+        self.label_flow_window = self.MakeRibbonLabel(
+            self.groupTrafficMonitor, 'LabelFlowWindow', 'Flow Window (s)')
+        self.edit_flow_window = self.MakeRibbonEdit(
+            self.groupTrafficMonitor, 'EditFlowWindow', '60')
+
+        self.button_start_traffic_monitoring = self.MakeRibbonButton(
+            self.groupTrafficMonitor, 'ButtonStartTrafficMonitoring', 'Start Monitoring',
+            RibbonButtonHandlerStartTrafficMonitoring)
+        self.button_start_traffic_monitoring.Width = 160
+
+        self.button_stop_traffic_monitoring = self.MakeRibbonButton(
+            self.groupTrafficMonitor, 'ButtonStopTrafficMonitoring', 'Stop Monitoring',
+            RibbonButtonHandlerStopTrafficMonitoring)
+        self.button_stop_traffic_monitoring.Width = 160
+
+        self.label_traffic_monitor_summary = self.MakeRibbonLabel(
+            self.groupTrafficMonitor, 'LabelTrafficMonitorSummary', 'Not monitoring.')
+        self.label_traffic_monitor_summary.Width = 480
+
+        # 計測結果の詳細(画面上のHUDと同じ内容をリボン側にもテキストエリア風に表示する)。
+        # リボンにはコンボボックス/リストボックスや複数行入力欄の専用コントロールが
+        # 無いため(IF8MainRibbonGroupProxyで確認できるのはCreateButton/CheckBox/
+        # Edit/Label/Panelのみ)、Editの高さを広げてText内で改行して代用している
+        self.edit_traffic_monitor_detail = self.MakeRibbonEdit(
+            self.groupTrafficMonitor, 'EditTrafficMonitorDetail', '')
+        self.edit_traffic_monitor_detail.Width = 260
+        self.edit_traffic_monitor_detail.Height = 80
+
     def KillRibbonUI(self):
         # MakeRibbonUIが途中で失敗していても後始末できるよう、
         # 各ステップはNoneチェックしてから実行する
         self.CloseCallbackEvent()
+
+        # --- Traffic Monitor タブ ---
+        if self.groupTrafficMonitor is not None:
+            for button in (self.button_stop_traffic_monitoring, self.button_start_traffic_monitoring):
+                if button is not None:
+                    button.UnRegisterEventHandlers()
+                    self.groupTrafficMonitor.DeleteControl(button)
+            self.button_stop_traffic_monitoring = None
+            self.button_start_traffic_monitoring = None
+            for ctrl in (self.edit_traffic_monitor_detail, self.label_traffic_monitor_summary,
+                         self.edit_flow_window, self.label_flow_window,
+                         self.edit_measurement_radius, self.label_measurement_radius,
+                         self.edit_zone_index, self.label_zone_index):
+                if ctrl is not None:
+                    self.groupTrafficMonitor.DeleteControl(ctrl)
+            self.edit_traffic_monitor_detail = None
+            self.label_traffic_monitor_summary = None
+            self.edit_flow_window = None
+            self.label_flow_window = None
+            self.edit_measurement_radius = None
+            self.label_measurement_radius = None
+            self.edit_zone_index = None
+            self.label_zone_index = None
+            if self.tabTrafficMonitor is not None:
+                self.tabTrafficMonitor.DeleteGroup(self.groupTrafficMonitor)
+            self.groupTrafficMonitor = None
+
+        if self.tabTrafficMonitor is not None:
+            if self.tabTrafficMonitor.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
+                self.ribbonMenu.DeleteTab(self.tabTrafficMonitor)
+            self.tabTrafficMonitor = None
 
         # --- Road Obstructions タブ ---
         if self.panel_obstructions is not None:
@@ -673,6 +1319,17 @@ class RibbonUI:
                 self.button_list_obstructions.UnRegisterEventHandlers()
                 self.groupObstructions.DeleteControl(self.button_list_obstructions)
                 self.button_list_obstructions = None
+            if self.button_jump_to_obstruction is not None:
+                self.button_jump_to_obstruction.UnRegisterEventHandlers()
+                self.groupObstructions.DeleteControl(self.button_jump_to_obstruction)
+                self.button_jump_to_obstruction = None
+            for ctrl in (self.edit_obstruction_jump_index, self.label_obstruction_jump_index,
+                         self.label_obstruction_jump_summary):
+                if ctrl is not None:
+                    self.groupObstructions.DeleteControl(ctrl)
+            self.edit_obstruction_jump_index = None
+            self.label_obstruction_jump_index = None
+            self.label_obstruction_jump_summary = None
             if self.tabObstructions is not None:
                 self.tabObstructions.DeleteGroup(self.groupObstructions)
             self.groupObstructions = None
@@ -682,51 +1339,71 @@ class RibbonUI:
                 self.ribbonMenu.DeleteTab(self.tabObstructions)
             self.tabObstructions = None
 
-        # --- Placement タブ ---
-        if self.groupPlacement is not None:
-            for button in (self.button_list_barricades, self.button_clear_all,
-                            self.button_reset_obstruction, self.button_place_obstruction):
+        # --- Reset タブ ---
+        if self.groupReset is not None:
+            for button in (self.button_clear_all, self.button_reset_obstruction):
                 if button is not None:
                     button.UnRegisterEventHandlers()
-                    self.groupPlacement.DeleteControl(button)
-            self.button_list_barricades = None
+                    self.groupReset.DeleteControl(button)
             self.button_clear_all = None
             self.button_reset_obstruction = None
-            self.button_place_obstruction = None
-            if self.label_barricade_summary is not None:
-                self.groupPlacement.DeleteControl(self.label_barricade_summary)
-                self.label_barricade_summary = None
-            if self.tabPlacement is not None:
-                self.tabPlacement.DeleteGroup(self.groupPlacement)
-            self.groupPlacement = None
+            if self.tabReset is not None:
+                self.tabReset.DeleteGroup(self.groupReset)
+            self.groupReset = None
 
-        if self.tabPlacement is not None:
-            if self.tabPlacement.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
-                self.ribbonMenu.DeleteTab(self.tabPlacement)
-            self.tabPlacement = None
+        if self.tabReset is not None:
+            if self.tabReset.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
+                self.ribbonMenu.DeleteTab(self.tabReset)
+            self.tabReset = None
 
-        # --- Position タブ ---
-        if self.groupPosition is not None:
-            if self.button_get_camera_position is not None:
-                self.button_get_camera_position.UnRegisterEventHandlers()
-                self.groupPosition.DeleteControl(self.button_get_camera_position)
-                self.button_get_camera_position = None
-            for ctrl in (self.edit_longitude, self.label_longitude,
-                         self.edit_latitude, self.label_latitude):
+        # --- Barricades タブ ---
+        if self.groupBarricades is not None:
+            for button in (self.button_jump_to_barricade, self.button_place_barricades):
+                if button is not None:
+                    button.UnRegisterEventHandlers()
+                    self.groupBarricades.DeleteControl(button)
+            self.button_jump_to_barricade = None
+            self.button_place_barricades = None
+            for ctrl in (self.edit_jump_index, self.label_jump_index,
+                         self.label_jump_summary, self.label_barricades_summary,
+                         self.edit_max_road_distance, self.label_max_road_distance,
+                         self.edit_probability_threshold, self.label_probability_threshold):
                 if ctrl is not None:
-                    self.groupPosition.DeleteControl(ctrl)
-            self.edit_longitude = None
-            self.label_longitude = None
-            self.edit_latitude = None
-            self.label_latitude = None
-            if self.tabPosition is not None:
-                self.tabPosition.DeleteGroup(self.groupPosition)
-            self.groupPosition = None
+                    self.groupBarricades.DeleteControl(ctrl)
+            self.edit_jump_index = None
+            self.label_jump_index = None
+            self.label_jump_summary = None
+            self.label_barricades_summary = None
+            self.edit_max_road_distance = None
+            self.label_max_road_distance = None
+            self.edit_probability_threshold = None
+            self.label_probability_threshold = None
+            if self.tabBarricades is not None:
+                self.tabBarricades.DeleteGroup(self.groupBarricades)
+            self.groupBarricades = None
 
-        if self.tabPosition is not None:
-            if self.tabPosition.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
-                self.ribbonMenu.DeleteTab(self.tabPosition)
-            self.tabPosition = None
+        if self.tabBarricades is not None:
+            if self.tabBarricades.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
+                self.ribbonMenu.DeleteTab(self.tabBarricades)
+            self.tabBarricades = None
+
+        # --- CSV タブ ---
+        if self.groupCsv is not None:
+            if self.button_browse_csv is not None:
+                self.button_browse_csv.UnRegisterEventHandlers()
+                self.groupCsv.DeleteControl(self.button_browse_csv)
+                self.button_browse_csv = None
+            if self.label_csv_summary is not None:
+                self.groupCsv.DeleteControl(self.label_csv_summary)
+                self.label_csv_summary = None
+            if self.tabCsv is not None:
+                self.tabCsv.DeleteGroup(self.groupCsv)
+            self.groupCsv = None
+
+        if self.tabCsv is not None:
+            if self.tabCsv.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
+                self.ribbonMenu.DeleteTab(self.tabCsv)
+            self.tabCsv = None
 
         self.ribbonMenu = None
 
@@ -740,12 +1417,27 @@ def main():
     global logProxy
     global ribbon
     global currentObstructions
+    global currentRoadObstructionItems
     global pendingObstructions
+    global loadedCsvPath
+    global loadedCsvRecords
+    global hudOverlay
+    global trafficMonitoring
+    global monitoredZoneIndex
+    global monitoredPosition
     winRoadProxy = None
     logProxy = None
     ribbon = None
     currentObstructions = []
+    currentRoadObstructionItems = []
     pendingObstructions = []
+    loadedCsvPath = None
+    loadedCsvRecords = []
+    hudOverlay = None
+    trafficMonitoring = False
+    monitoredZoneIndex = None
+    monitoredPosition = None
+    ResetTrafficMetricsState()
 
     try:
         # APIのエントリポイント
@@ -787,6 +1479,8 @@ def main():
         while loopFlg:
             time.sleep(0.005)
             ApplyPendingObstructions()
+            UpdateTrafficMetrics()
+            PumpHudOverlay()
             loopFlg = winRoadProxy.ApplicationServices.IsPythonScriptRun
             if loopFlg == False:
                 logProxy.logger.info("loopFlg={}".format(loopFlg))
@@ -804,6 +1498,17 @@ def main():
         elapsed_time = time.perf_counter_ns() - start
         if logProxy is not None:
             logProxy.logger.info("Total:{}ms".format(elapsed_time / 1000000))
+
+        # 交通流計測(HUD)の停止。スクリプト終了後もオーバーレイウィンドウが
+        # 残ってしまうと、次回実行時にウィンドウが二重に出てしまう
+        try:
+            trafficMonitoring = False
+            if hudOverlay is not None:
+                hudOverlay.Destroy()
+                hudOverlay = None
+        except Exception:
+            if logProxy is not None:
+                logProxy.logger.error(traceback.format_exc())
 
         # 設置中の障害物とリボンの削除（失敗してもログ後始末は必ず行う）
         try:
