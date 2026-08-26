@@ -16,12 +16,6 @@ MAX_DISPLAYED_OBSTRUCTIONS = 3
 # Pylonは回転対称な形状のため、向き(YawAngle)の設定は不要
 OBSTRUCTION_MODEL_NAME = 'Pylon'
 
-# 停止車両(回避対象)をSetDisplayedIn(0, False)で非表示にするかどうか。
-# 非表示化が障害物認識も無効化している疑いがあったため一時的にFalseにして検証した結果、
-# 表示していても他車両は後ろで停止・渋滞するだけで車線変更はしないと判明した
-# (=非表示化が原因ではなかった)。そのため見た目をPylonのみにするため再度Trueに戻す
-HIDE_BLOCKING_VEHICLE = True
-
 # APIのエントリポイント
 winRoadProxy = None
 const = None
@@ -42,15 +36,6 @@ currentObstructions = []
 # (車線ごとに1個ずつ生成するため、複数件を同時に待たせられるようリストで持つ)
 PLACEMENT_SETTLE_TICKS = 20  # ループは5ms間隔なので、20ティック=約100ms待つ
 pendingObstructions = []
-
-# Pylon(見た目)だけでは他車両のAIが障害物として認識してくれないため、同じ車線の
-# 同じ位置に実際の車両(見た目は非表示にする)を停止させて配置し、他車両に回避させる。
-# 現在配置中の停止車両(常に0個か1個)。{'instance':...}
-currentBlockingVehicle = None
-# AddNewVehicle直後も同様に、生成と設定(Brake固定・非表示化・コールバック登録)を分離する
-pendingBlockingVehicle = None
-# 停止車両に登録したコールバックイベント(SetCallbackHandlers/CloseCallbackEvent用)
-blockingVehicleEventList = []
 
 
 # UC-win/Roadのリボン(または Script Editor)の [Async] チェックがONのときだけ、
@@ -210,36 +195,22 @@ def PlaceObstruction():
         return
 
     # 各車線の中央位置を求め、入力座標(x, z)に最も近い車線1本だけを選ぶ
-    # (併せて、その車線が進行方向内で何番目の車線か(1始まり)も数えておく。
-    #  AddNewVehicleのF8COMVehiclePlacementType.Laneに渡すために必要)
     nearestPosition = None
     nearestSqDist = None
     nearestLaneIndex = None
-    nearestLane = None
-    nearestLaneNumberInDirection = None
-    forwardCount = 0
-    backwardCount = 0
     for laneIndex in range(laneCount):
         lane = road.RoadLane(laneIndex)
         if lane is None:
             continue
-        if lane.IsForward:
-            forwardCount += 1
-            numberInDirection = forwardCount
-        else:
-            backwardCount += 1
-            numberInDirection = backwardCount
         position = lane.GetPosition(distanceAlong, const._ldRoad)
         sqDist = (position.X - x) ** 2 + (position.Z - z) ** 2
         logProxy.logger.info(
             f'PlaceObstruction: lane[{laneIndex}] position=({position.X}, {position.Y}, {position.Z}) '
-            f'IsForward={lane.IsForward} numberInDirection={numberInDirection} sqDist={sqDist:.2f}')
+            f'sqDist={sqDist:.2f}')
         if nearestSqDist is None or sqDist < nearestSqDist:
             nearestSqDist = sqDist
             nearestPosition = position
             nearestLaneIndex = laneIndex
-            nearestLane = lane
-            nearestLaneNumberInDirection = numberInDirection
 
     if nearestPosition is None:
         logProxy.logger.error('PlaceObstruction: no usable lane found, aborting')
@@ -284,107 +255,6 @@ def PlaceObstruction():
         logProxy.logger.info(
             f'PlaceObstruction: {len(newObstructions)} instance(s) created, Position deferred to next ticks')
 
-    PlaceBlockingVehicle(road, nearestLane, nearestLaneNumberInDirection, distanceAlong)
-
-
-# Pylon(見た目)だけでは他車両のAIが障害物として認識しないため、同じ車線・同じ位置に
-# 実際の車両(AddNewVehicle)を停止状態で配置する。これにより、後続車両はこの停止車両を
-# 検知して手前で停止・渋滞するようになる(車線変更して迂回する挙動はAIに存在せず、
-# スクリプトからの制御入力上書きも効かないため断念した。詳細はCLAUDE.md参照)。
-# 見た目はPylonのままにしたいので、この車両自体は非表示化を試みる(SetDisplayedIn)。
-# 既存の停止車両があれば毎回作り直す(Position書き込みでの移動は試していないため)
-def PlaceBlockingVehicle(road, lane, laneNumberInDirection, distanceAlong):
-    global currentBlockingVehicle, pendingBlockingVehicle
-
-    RemoveBlockingVehicle()
-
-    vehicleModel = FindVehicleModel()
-    if vehicleModel is None:
-        logProxy.logger.error('PlaceBlockingVehicle: no vehicle model found in project, aborting')
-        return
-
-    vptype = com.DispatchEx('UCwinRoad.F8COMVehiclePlacementType')
-    vptype.IsForward = lane.IsForward
-    vptype.Lane = laneNumberInDirection
-    vptype.Distance = distanceAlong
-    logProxy.logger.info(
-        f'PlaceBlockingVehicle: calling AddNewVehicle IsForward={lane.IsForward} '
-        f'Lane={laneNumberInDirection} Distance={distanceAlong:.1f}')
-
-    traffic = winRoadProxy.SimulationCore.TrafficSimulation
-    instance = traffic.AddNewVehicle(vehicleModel, road, vptype)
-    logProxy.logger.info('PlaceBlockingVehicle: AddNewVehicle returned')
-    if instance is None:
-        logProxy.logger.error('PlaceBlockingVehicle: AddNewVehicle returned None, aborting')
-        return
-
-    # 生成直後は何も設定せず、メインループ側で数ティック後に停止・非表示化する
-    currentBlockingVehicle = {'instance': instance}
-    pendingBlockingVehicle = {'instance': instance, 'ticksRemaining': PLACEMENT_SETTLE_TICKS}
-    logProxy.logger.info('PlaceBlockingVehicle: vehicle created, immobilize/hide deferred to next ticks')
-
-
-# メインループから毎ティック呼ばれる。生成直後で設定待ちの停止車両があれば、
-# 既定のティック数が経過してからBrake固定・非表示化・コールバック登録を行う
-def ApplyPendingBlockingVehicle():
-    global pendingBlockingVehicle
-    if pendingBlockingVehicle is None:
-        return
-    pendingBlockingVehicle['ticksRemaining'] -= 1
-    if pendingBlockingVehicle['ticksRemaining'] > 0:
-        return
-
-    instance = pendingBlockingVehicle['instance']
-    pendingBlockingVehicle = None
-
-    logProxy.logger.info('ApplyPendingBlockingVehicle: immobilizing vehicle')
-    instance.Brake = 1.0
-    instance.Throttle = 0.0
-    instance.EngineOn = False
-    instance.ParkingBrake = True
-    logProxy.logger.info('ApplyPendingBlockingVehicle: immobilized successfully')
-
-    if HIDE_BLOCKING_VEHICLE:
-        try:
-            instance.SetDisplayedIn(0, False)
-            logProxy.logger.info('ApplyPendingBlockingVehicle: SetDisplayedIn(0, False) succeeded')
-        except Exception:
-            logProxy.logger.error('ApplyPendingBlockingVehicle: SetDisplayedIn failed:\n' + traceback.format_exc())
-
-    global blockingVehicleEventList
-    SetCallbackHandlers(blockingVehicleEventList, instance, BlockingVehicleHandler)
-    if blockingVehicleEventList:
-        # ハンドラは複数車両で共有されうるため、対象IDをEventオブジェクト側に持たせる
-        blockingVehicleEventList[-1][1].targetId = instance.ID
-    logProxy.logger.info('ApplyPendingBlockingVehicle: callback registered, done')
-
-
-# 停止車両をシミュレーションから削除する(コールバック解除も行う)
-def RemoveBlockingVehicle():
-    global currentBlockingVehicle, pendingBlockingVehicle
-    pendingBlockingVehicle = None
-    CloseCallbackEvent(blockingVehicleEventList)
-    if currentBlockingVehicle is None:
-        logProxy.logger.info('RemoveBlockingVehicle: nothing to remove')
-        return
-    traffic = winRoadProxy.SimulationCore.TrafficSimulation
-    logProxy.logger.info('RemoveBlockingVehicle: calling DeleteTransientObject')
-    traffic.DeleteTransientObject(currentBlockingVehicle['instance'])
-    logProxy.logger.info('RemoveBlockingVehicle: removed successfully')
-    currentBlockingVehicle = None
-
-
-# 停止車両に登録するコールバック。他車両にも発火しうるため、必ずIDで対象を絞ってから
-# Brake等を毎ティック強制する(CLAUDE.mdに記載の元の設計と同じパターン)
-class BlockingVehicleHandler(TransientInstanceHandler):
-    def OnBeforeCalculateMovement(self, dTimeInSeconds, proxy):
-        vehicle = com.Dispatch(proxy)
-        if vehicle.ID != self.targetId:
-            return
-        vehicle.Brake = 1.0
-        vehicle.Throttle = 0.0
-        vehicle.EngineOn = False
-
 
 # メインループから毎ティック呼ばれる。生成直後で設定待ちの障害物があれば、
 # 既定のティック数が経過したものから順にPositionを設定する
@@ -412,10 +282,9 @@ def ApplyPendingObstructions():
         logProxy.logger.info('ApplyPendingObstructions: done')
 
 
-# 設置中の障害物(Pylonと停止車両の両方)をすべてシミュレーションから削除する
+# 設置中のPylonをすべてシミュレーションから削除する
 def ResetObstruction():
     global currentObstructions, pendingObstructions
-    RemoveBlockingVehicle()
     # 設定待ちのまま削除すると、後でApplyPendingObstructionsが削除済みインスタンスに
     # Positionを設定しようとしてしまうため、先に取り消しておく
     pendingObstructions = []
@@ -432,15 +301,12 @@ def ResetObstruction():
 
 # プロジェクト内の全ての一時オブジェクト(Transient)を無条件に削除する。
 # このスクリプトは実行のたびにcurrentObstructions等をNoneでリセットするため、
-# 過去の実行がクラッシュ等で正常終了しなかった場合、その回で配置したPylon/停止車両が
+# 過去の実行がクラッシュ等で正常終了しなかった場合、その回で配置したPylonが
 # 道路上に残ったまま追跡できなくなることがある。それらの残骸を一掃するための
 # 強制リセット用ボタン(このスクリプトが把握していないオブジェクトも含め、プロジェクト内の
 # 一時オブジェクトを全て削除するため、通常の走行中の交通車両にも影響しうる点に注意)
 def ClearAllTransientObjects():
     global currentObstructions, pendingObstructions
-    global currentBlockingVehicle, pendingBlockingVehicle
-
-    CloseCallbackEvent(blockingVehicleEventList)
 
     traffic = winRoadProxy.SimulationCore.TrafficSimulation
     logProxy.logger.info('ClearAllTransientObjects: calling DeleteAllTransientObjects')
@@ -449,8 +315,6 @@ def ClearAllTransientObjects():
 
     currentObstructions = []
     pendingObstructions = []
-    currentBlockingVehicle = None
-    pendingBlockingVehicle = None
 
 
 # 現在スクリプトが認識している配置済みバリケードの情報を、実際にUC-win/Road側の
@@ -558,21 +422,6 @@ def FindThreeDModelByName(name):
             return model
 
     logProxy.logger.error(f"3D model '{name}' not found among {count} model(s) in the project.")
-    return None
-
-
-# プロジェクト内から最初に見つかった車両モデル(ModelType==const._VehicleModel)を返す。
-# 停止車両(他車両に回避させるための実体)として使う。Sample_VehiclePlacement.pyと同じ探し方
-def FindVehicleModel():
-    prj = winRoadProxy.Project
-    count = prj.ThreeDModelsCount
-
-    for i in range(count):
-        model = prj.ThreeDModel(i)
-        if model is not None and model.ModelType == const._VehicleModel:
-            return model
-
-    logProxy.logger.error(f"No vehicle model (ModelType=_VehicleModel) found among {count} model(s).")
     return None
 
 
@@ -872,17 +721,11 @@ def main():
     global ribbon
     global currentObstructions
     global pendingObstructions
-    global currentBlockingVehicle
-    global pendingBlockingVehicle
-    global blockingVehicleEventList
     winRoadProxy = None
     logProxy = None
     ribbon = None
     currentObstructions = []
     pendingObstructions = []
-    currentBlockingVehicle = None
-    pendingBlockingVehicle = None
-    blockingVehicleEventList = []
 
     try:
         # APIのエントリポイント
@@ -924,7 +767,6 @@ def main():
         while loopFlg:
             time.sleep(0.005)
             ApplyPendingObstructions()
-            ApplyPendingBlockingVehicle()
             loopFlg = winRoadProxy.ApplicationServices.IsPythonScriptRun
             if loopFlg == False:
                 logProxy.logger.info("loopFlg={}".format(loopFlg))
