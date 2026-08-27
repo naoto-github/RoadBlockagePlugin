@@ -3,6 +3,7 @@ from UCwinRoadCOM import *
 from LoggerProxy import LoggerProxy
 from UCwinRoadUtils import *
 from CallbackHandlers import *
+import collections
 import csv
 import math
 import os
@@ -66,11 +67,15 @@ loadedCsvPath = None
 loadedCsvRecords = []
 
 # --- 交通流計測(Traffic Monitor) ---
-# 配置済みBarricadeのうち、ユーザーが1件選んだものの位置を中心に、周辺の車両
-# (TransientCar)を定期的に取得して「平均速度」「流量(単位時間あたりの新規進入台数)」
-# を計測し、HUDに表示する。バリケード自体は見た目上のオブジェクトで交通AIに影響しない
-# ため、UC-win/Roadのエディタ上で同じ場所に手動で道路障害物(F8RoadObstructionProxy)を
-# 追加/削除しながら変化を確認する使い方を想定している。
+# CSVタブで読み込み済みのレコードのうち、ユーザーが1件選んだ緯度経度に最も近い道路上の
+# 位置を中心に、周辺の車両(TransientCar)を定期的に取得して「平均速度」「現在の車両数」を
+# 計測し、HUD・グラフで表示する。バリケードの配置は前提とせず、CSVレコードの位置そのもの
+# を直接監視できる(バリケードが無くても計測できるようにするため、Barricadeの配置有無から
+# 独立させている)。UC-win/Roadのエディタ上で同じ場所に手動で道路障害物
+# (F8RoadObstructionProxy)を追加/削除しながら変化を確認する使い方を想定している。
+# (流量(単位時間あたりの新規進入台数)も一度実装したが、値の意味が分かりにくく
+# あまり有用でないとユーザーからフィードバックがあったため削除した。再度必要になった
+# 場合は、車両IDの集合を前回分と比較して新規進入を検出するロジックから再実装できる)
 
 # HUD描画の間引き間隔(秒)。毎ティック(5ms)計測すると重いため、この間隔でのみ更新する
 TRAFFIC_METRICS_UPDATE_INTERVAL_SECONDS = 0.5
@@ -78,17 +83,22 @@ TRAFFIC_METRICS_UPDATE_INTERVAL_SECONDS = 0.5
 # 計測中かどうか(Start/Stopボタンで切り替え)
 trafficMonitoring = False
 
-# 計測開始時にどのBarricadeを選んだか(currentObstructions内の並び順)。表示・ログ用に
+# 計測開始時にどのCSVレコードを選んだか(loadedCsvRecords内のインデックス)。表示・ログ用に
 # 保持するだけで、計測そのものはmonitoredPosition(下記)という固定座標を使う。
 # 未選択(計測していない)場合はNone
-monitoredZoneIndex = None
+monitoredRecordIndex = None
 
-# 計測の基準となる固定座標(F8COMdVec3)。Start Monitoring時点でのBarricadeの位置を
-# コピーして保持する。バリケードは配置後に動かないため、Barricadeインスタンス自体を
-# 参照し続ける必要は無く、むしろResetでバリケードを削除しても同じ場所の計測を続けたい
-# というユーザー要望があるため、インスタンスではなく座標そのものを固定値として持つ設計
-# にしている。未選択(計測していない)場合はNone
+# 計測の基準となる固定座標(F8COMdVec3)。Start Monitoring時点で選んだCSVレコードの
+# 緯度経度から最も近い道路上の位置を求め、その座標をコピーして保持する。道路自体は
+# 動かないため毎回緯度経度から引き直す必要はなく、またBarricadeの配置有無にも
+# 依存しない。未選択(計測していない)場合はNone
 monitoredPosition = None
+
+# Avg Speed/Vehicles in Zoneの推移をグラフ表示するために保持する履歴。要素は
+# {'time':, 'avgSpeedKmh':, 'vehicleCount':} のdict。最大件数を超えたら古いものから
+# 自動的に捨てる(collections.dequeのmaxlen)
+METRICS_HISTORY_MAX_POINTS = 120
+metricsHistory = collections.deque(maxlen=METRICS_HISTORY_MAX_POINTS)
 
 # HUD用の独立ウィンドウ(main()で生成、HudOverlayWindowのインスタンス)。
 # UC-win/Roadのメイン3DビューへのOpenGL直接描画は2通り試して(OnOpenGLAfterDrawScene
@@ -104,15 +114,9 @@ hudOverlay = None
 HUD_POSITION_UPDATE_INTERVAL_SECONDS = 0.5
 lastHudPositionUpdateTime = 0.0
 
-# 直近の計測結果。{'index':, 'position':, 'vehicleCount':, 'avgSpeedKmh':,
-# 'flowVehPerHour':} のdict、または未計測ならNone。HUD/リボンの両方で参照する
+# 直近の計測結果。{'index':, 'position':, 'vehicleCount':, 'avgSpeedKmh':} のdict、
+# または未計測ならNone。HUD/リボンの両方で参照する
 currentTrafficMetric = None
-
-# 選択中ゾーンの計測用の内部状態
-# previousVehicleIds: 直前の計測時にゾーン内にいた車両IDの集合(新規進入検出用)
-# flowEventTimestamps: 直近の計測ウィンドウ内で新規進入を検出した時刻のリスト
-previousVehicleIds = set()
-flowEventTimestamps = []
 
 # UpdateTrafficMetrics()の間引き用に前回更新時刻(time.time())を保持する
 lastTrafficMetricsUpdateTime = 0.0
@@ -260,6 +264,24 @@ def FindNearestRoadPoint(x, z):
         dist += fineStep
 
     return bestRoad, bestDistanceAlong
+
+
+# 緯度経度に最も近い道路の中心線上の位置(F8COMdVec3)を返す。Traffic Monitorの
+# 計測基準点算出専用のヘルパーで、FindNearestLanePositionと違い車線・向き・
+# 前後オフセットは考慮しない(Barricadeの配置有無に関係なく、CSVレコードの緯度経度が
+# 指す地点そのものを直接監視できるようにするための、より単純な位置決め)。
+# 道路が見つからない場合はNone
+def FindNearestRoadPositionForMonitoring(latitude, longitude):
+    local = LatLonToLocalXZ(latitude, longitude)
+    if local is None:
+        return None
+    x, z = local
+
+    found = FindNearestRoadPoint(x, z)
+    if found is None:
+        return None
+    road, distanceAlong = found
+    return road.GetPositionAt(distanceAlong)
 
 
 # 緯度経度1件分について、最も近い道路・車線を求め、その地点(中心)から道路に沿って
@@ -480,7 +502,29 @@ class HudOverlayWindow:
         self.label = tk.Label(
             self.root, text='', fg='#FFFF00', bg='#1a1a1a',
             font=('Consolas', 18, 'bold'), justify='left', anchor='w')
-        self.label.pack(padx=14, pady=10)
+        self.label.pack(padx=14, pady=(10, 4), anchor='w')
+
+        # Avg Speed/Vehicles in Zoneの推移を表示する2つの小さな折れ線グラフ。数値だけ
+        # だと「今どちらに向かっているか」が分かりにくいため、CSVレコードを切り替える
+        # 度に履歴はリセットされる前提でシンプルな折れ線を描く(軸目盛りは付けず、
+        # 現在値と直近の最小/最大だけラベルで添える)。Flowの推移も一度表示したが、
+        # 値の意味が分かりにくくあまり有用でないとのフィードバックがあり削除した
+        self.speedGraphLabel = tk.Label(
+            self.root, text='Avg Speed (km/h)', fg='#66FF99', bg='#1a1a1a',
+            font=('Consolas', 10, 'bold'), justify='left', anchor='w')
+        self.speedGraphLabel.pack(padx=14, pady=(6, 0), anchor='w')
+        self.speedCanvas = tk.Canvas(
+            self.root, width=320, height=70, bg='#000000', highlightthickness=0)
+        self.speedCanvas.pack(padx=14, pady=(0, 4))
+
+        self.vehicleCountGraphLabel = tk.Label(
+            self.root, text='Vehicles in Zone', fg='#FF9966', bg='#1a1a1a',
+            font=('Consolas', 10, 'bold'), justify='left', anchor='w')
+        self.vehicleCountGraphLabel.pack(padx=14, pady=(2, 0), anchor='w')
+        self.vehicleCountCanvas = tk.Canvas(
+            self.root, width=320, height=70, bg='#000000', highlightthickness=0)
+        self.vehicleCountCanvas.pack(padx=14, pady=(0, 10))
+
         self.root.geometry('+20+20')
         self._readyEvent.set()
         self._PollQueue()
@@ -494,6 +538,11 @@ class HudOverlayWindow:
                 action, payload = self._queue.get_nowait()
                 if action == 'text':
                     self.label.config(text=payload)
+                elif action == 'history':
+                    speedValues, vehicleCountValues = payload
+                    self._DrawLineGraph(self.speedCanvas, speedValues, '#66FF99', ' km/h')
+                    self._DrawLineGraph(
+                        self.vehicleCountCanvas, vehicleCountValues, '#FF9966', '', decimals=0)
                 elif action == 'anchor':
                     # メインウィンドウの矩形(left, top, right, bottom)を右下基準に
                     # 配置する。ウィンドウ自身の現在のサイズ(フォント変更等で変わり
@@ -513,8 +562,53 @@ class HudOverlayWindow:
             pass
         self.root.after(50, self._PollQueue)
 
+    # values(数値のリスト、古い順)を単純な折れ線としてcanvasに描画する。
+    # 目盛りは付けず、最小値・最大値・直近値だけをテキストで添えて相対的な変化が
+    # 分かるようにする。matplotlib等の追加ライブラリはUC-win/Roadのプラグイン
+    # ホストに入っている保証がないため、tkinter標準のCanvas描画だけで完結させている
+    def _DrawLineGraph(self, canvas, values, color, unitSuffix, decimals=1):
+        canvas.delete('all')
+        width = int(canvas['width'])
+        height = int(canvas['height'])
+        marginTop = 14
+        marginBottom = 4
+
+        if len(values) < 2:
+            return
+
+        vMin = min(values)
+        vMax = max(values)
+        if vMax - vMin < 1e-6:
+            vMax = vMin + 1.0
+
+        n = len(values)
+        plotHeight = height - marginTop - marginBottom
+        points = []
+        for i, v in enumerate(values):
+            x = i / (n - 1) * (width - 8) + 4
+            y = marginTop + plotHeight - (v - vMin) / (vMax - vMin) * plotHeight
+            points.append((x, y))
+
+        for i in range(len(points) - 1):
+            canvas.create_line(
+                points[i][0], points[i][1], points[i + 1][0], points[i + 1][1],
+                fill=color, width=2)
+
+        canvas.create_text(
+            2, 2, text=f"{vMax:.0f}", fill=color, anchor='nw', font=('Consolas', 8))
+        canvas.create_text(
+            2, height - 2, text=f"{vMin:.0f}", fill=color, anchor='sw', font=('Consolas', 8))
+        canvas.create_text(
+            width - 2, 2, text=f"{values[-1]:.{decimals}f}{unitSuffix}", fill=color, anchor='ne',
+            font=('Consolas', 9, 'bold'))
+
     def SetText(self, text):
         self._queue.put(('text', text))
+
+    # speedValues/vehicleCountValuesは、それぞれAvg Speed(km/h)/Vehicles in Zoneの
+    # 履歴(古い順の数値リスト)
+    def SetHistory(self, speedValues, vehicleCountValues):
+        self._queue.put(('history', (speedValues, vehicleCountValues)))
 
     # mainRectはメインウィンドウの(left, top, right, bottom)。この矩形の右下に
     # 追従して自身を配置する
@@ -554,13 +648,14 @@ def FindMainWindowHandle():
 
 
 # 計測開始時に固定した座標(monitoredPosition)の周辺(半径radius以内)の車両を
-# TrafficSimulation.GetTransientObjectsArroundで取得し、平均速度と流量(単位時間
-# あたりの新規進入台数)を計測する。メインループから毎ティック呼ばれるが、
-# 内部でTRAFFIC_METRICS_UPDATE_INTERVAL_SECONDSにより間引く(全車両走査は重いため)。
+# TrafficSimulation.GetTransientObjectsArroundで取得し、平均速度と現在の車両数を
+# 計測する。メインループから毎ティック呼ばれるが、内部で
+# TRAFFIC_METRICS_UPDATE_INTERVAL_SECONDSにより間引く(全車両走査は重いため)。
 # Barricadeインスタンス自体は参照しないため、Reset等でBarricadeが削除されても
 # 同じ場所での計測を継続できる
 def UpdateTrafficMetrics():
-    global lastTrafficMetricsUpdateTime, currentTrafficMetric, previousVehicleIds, flowEventTimestamps
+    global lastTrafficMetricsUpdateTime, currentTrafficMetric
+    global metricsHistory
 
     if not trafficMonitoring or monitoredPosition is None:
         return
@@ -574,12 +669,6 @@ def UpdateTrafficMetrics():
         radius = float(ribbon.edit_measurement_radius.Text)
     except ValueError:
         radius = 50.0
-    try:
-        flowWindowSeconds = float(ribbon.edit_flow_window.Text)
-    except ValueError:
-        flowWindowSeconds = 60.0
-    if flowWindowSeconds <= 0:
-        flowWindowSeconds = 60.0
 
     traffic = winRoadProxy.SimulationCore.TrafficSimulation
     position = monitoredPosition
@@ -597,34 +686,27 @@ def UpdateTrafficMetrics():
         currentVehicleIds.add(obj.ID)
         speeds.append(obj.Speed(const._KiloMeterPerHour))
 
-    # 前回はゾーン内になく、今回初めてゾーン内に現れた車両を「新規進入」として
-    # 流量カウントの対象にする(既にゾーン内に留まっている車両は数えない)
-    newlyEnteredIds = currentVehicleIds - previousVehicleIds
-    previousVehicleIds = currentVehicleIds
-
-    flowEventTimestamps.extend([now] * len(newlyEnteredIds))
-    cutoff = now - flowWindowSeconds
-    flowEventTimestamps = [t for t in flowEventTimestamps if t >= cutoff]
-
     avgSpeedKmh = sum(speeds) / len(speeds) if speeds else 0.0
-    # 直近flowWindowSeconds間の新規進入台数を1時間あたりの台数に換算する
-    flowVehPerHour = len(flowEventTimestamps) / flowWindowSeconds * 3600.0
+    vehicleCount = len(currentVehicleIds)
 
     currentTrafficMetric = {
-        'index': monitoredZoneIndex,
+        'index': monitoredRecordIndex,
         'position': position,
-        'vehicleCount': len(currentVehicleIds),
+        'vehicleCount': vehicleCount,
         'avgSpeedKmh': avgSpeedKmh,
-        'flowVehPerHour': flowVehPerHour,
     }
+    metricsHistory.append({'time': now, 'avgSpeedKmh': avgSpeedKmh, 'vehicleCount': vehicleCount})
+
     if ribbon is not None:
         ribbon.ShowTrafficMetrics(currentTrafficMetric)
     if hudOverlay is not None:
         hudOverlay.SetText(
-            f"Barricade[{monitoredZoneIndex}]\n"
-            f"Flow: {flowVehPerHour:.0f} veh/h\n"
+            f"CSV Record[{monitoredRecordIndex}]\n"
             f"Avg Speed: {avgSpeedKmh:.1f} km/h\n"
-            f"Vehicles: {len(currentVehicleIds)}")
+            f"Vehicles: {vehicleCount}")
+        hudOverlay.SetHistory(
+            [m['avgSpeedKmh'] for m in metricsHistory],
+            [m['vehicleCount'] for m in metricsHistory])
 
 
 # HUDオーバーレイウィンドウの位置をUC-win/Roadのメインウィンドウに追従させる。
@@ -647,42 +729,47 @@ def PumpHudOverlay():
         hudOverlay.SetAnchorRect(rect)
 
 
-# 選択中ゾーンの計測状態(前回検出した車両ID集合・流量カウント用タイムスタンプ・直近の
-# 計測結果)を初期化する。計測対象の切り替え(Start)や、Barricadeの再配置
-# (ResetObstruction)のタイミングで呼ぶ
+# 選択中ゾーンの計測状態(直近の計測結果・グラフ履歴)を初期化する。
+# 計測対象の切り替え(Start)のタイミングで呼ぶ
 def ResetTrafficMetricsState():
-    global previousVehicleIds, flowEventTimestamps, lastTrafficMetricsUpdateTime, currentTrafficMetric
-    previousVehicleIds = set()
-    flowEventTimestamps = []
+    global lastTrafficMetricsUpdateTime, currentTrafficMetric
     lastTrafficMetricsUpdateTime = 0.0
     currentTrafficMetric = None
+    metricsHistory.clear()
 
 
 class RibbonButtonHandlerStartTrafficMonitoring(RibbonButtonHandler):
     def OnClick(self):
-        global trafficMonitoring, monitoredZoneIndex, monitoredPosition, hudOverlay
+        global trafficMonitoring, monitoredRecordIndex, monitoredPosition, hudOverlay
         try:
             if trafficMonitoring:
                 return
-            if not currentObstructions:
-                ribbon.label_traffic_monitor_summary.Caption = (
-                    "No Barricade placed. Place Barricades from CSV first.")
+            if not loadedCsvRecords:
+                ribbon.label_traffic_monitor_summary.Caption = "No CSV loaded. Use the CSV tab first."
                 return
             try:
-                index = int(ribbon.edit_zone_index.Text)
+                index = int(ribbon.edit_record_index.Text)
             except ValueError:
-                ribbon.label_traffic_monitor_summary.Caption = "Invalid Barricade index."
+                ribbon.label_traffic_monitor_summary.Caption = "Invalid CSV record index."
                 return
-            if index < 0 or index >= len(currentObstructions):
+            if index < 0 or index >= len(loadedCsvRecords):
                 ribbon.label_traffic_monitor_summary.Caption = (
-                    f"Index {index} out of range (0-{len(currentObstructions) - 1}).")
+                    f"Index {index} out of range (0-{len(loadedCsvRecords) - 1}).")
                 return
 
-            monitoredZoneIndex = index
-            # この時点のBarricadeの位置を固定座標としてコピーする。以降はBarricade
-            # インスタンス自体を参照しないため、Reset等でBarricadeが削除されても
-            # 同じ場所での計測を継続できる(ユーザー要望)
-            monitoredPosition = currentObstructions[index]['instance'].Position
+            record = loadedCsvRecords[index]
+            position = FindNearestRoadPositionForMonitoring(record['latitude'], record['longitude'])
+            if position is None:
+                ribbon.label_traffic_monitor_summary.Caption = (
+                    f"No road found near CSV record [{index}] "
+                    f"({record['latitude']}, {record['longitude']}).")
+                return
+
+            monitoredRecordIndex = index
+            # 選んだCSVレコードの緯度経度から求めた道路上の位置を固定座標としてコピーする。
+            # Barricadeの配置有無とは独立させているため、バリケードを一切配置していなくても
+            # (あるいはResetで削除しても)同じ場所での計測を継続できる(ユーザー要望)
+            monitoredPosition = position
             ResetTrafficMetricsState()
 
             if hudOverlay is None:
@@ -690,20 +777,20 @@ class RibbonButtonHandlerStartTrafficMonitoring(RibbonButtonHandler):
 
             trafficMonitoring = True
             logProxy.logger.info(
-                f'RibbonButtonHandlerStartTrafficMonitoring: monitoring started for index {index} '
+                f'RibbonButtonHandlerStartTrafficMonitoring: monitoring started for CSV record {index} '
                 f'at fixed position ({monitoredPosition.X:.1f}, {monitoredPosition.Y:.1f}, '
                 f'{monitoredPosition.Z:.1f})')
-            ribbon.label_traffic_monitor_summary.Caption = f"Monitoring Barricade[{index}]..."
+            ribbon.label_traffic_monitor_summary.Caption = f"Monitoring CSV record [{index}]..."
         except Exception:
             logProxy.logger.error(traceback.format_exc())
 
 
 class RibbonButtonHandlerStopTrafficMonitoring(RibbonButtonHandler):
     def OnClick(self):
-        global trafficMonitoring, monitoredZoneIndex, monitoredPosition, currentTrafficMetric, hudOverlay
+        global trafficMonitoring, monitoredRecordIndex, monitoredPosition, currentTrafficMetric, hudOverlay
         try:
             trafficMonitoring = False
-            monitoredZoneIndex = None
+            monitoredRecordIndex = None
             monitoredPosition = None
             currentTrafficMetric = None
             if hudOverlay is not None:
@@ -949,7 +1036,8 @@ class RibbonUI:
         self.button_browse_csv = None
         self.label_csv_summary = None
 
-        # Barricades タブ: CSVレコードに基づく障害物の設置・確認
+        # Barricades タブ: CSVレコードに基づく障害物の設置(検索・ジャンプ機能は
+        # Find Objects タブに集約したため、ここには配置系のコントロールのみを置く)
         self.tabBarricades = None
         self.groupBarricades = None
         self.label_probability_threshold = None
@@ -958,19 +1046,30 @@ class RibbonUI:
         self.edit_max_road_distance = None
         self.button_place_barricades = None
         self.label_barricades_summary = None
+
+        # Traffic Monitor タブ: 選択した1件のCSVレコードの位置周辺の交通流
+        # (流量・平均速度)の計測とHUD表示
+        self.tabTrafficMonitor = None
+        self.groupTrafficMonitor = None
+        self.label_record_index = None
+        self.edit_record_index = None
+        self.label_measurement_radius = None
+        self.edit_measurement_radius = None
+        self.button_start_traffic_monitoring = None
+        self.button_stop_traffic_monitoring = None
+        self.label_traffic_monitor_summary = None
+        self.edit_traffic_monitor_detail = None
+
+        # Find Objects タブ: 配置したBarricade、および道路に既存の道路障害物、
+        # それぞれをインデックス指定で検索(一覧・カメラジャンプ)する機能をここに集約する
+        self.tabFindObjects = None
+        # -- 配置したBarricadeを探すグループ --
+        self.groupFindBarricades = None
         self.label_jump_index = None
         self.edit_jump_index = None
         self.button_jump_to_barricade = None
         self.label_jump_summary = None
-
-        # Reset タブ: 配置済みBarricadeの解除・強制リセット
-        self.tabReset = None
-        self.groupReset = None
-        self.button_reset_obstruction = None
-        self.button_clear_all = None
-
-        # Obstructions タブ: 道路に既存の道路障害物の一覧
-        self.tabObstructions = None
+        # -- 道路に既存の道路障害物(F8RoadObstructionProxy)を探すグループ --
         self.groupObstructions = None
         self.button_list_obstructions = None
         self.panel_obstructions = None
@@ -981,20 +1080,11 @@ class RibbonUI:
         self.button_jump_to_obstruction = None
         self.label_obstruction_jump_summary = None
 
-        # Traffic Monitor タブ: 選択した1件のBarricade周辺の交通流(流量・平均速度)の
-        # 計測とHUD表示
-        self.tabTrafficMonitor = None
-        self.groupTrafficMonitor = None
-        self.label_zone_index = None
-        self.edit_zone_index = None
-        self.label_measurement_radius = None
-        self.edit_measurement_radius = None
-        self.label_flow_window = None
-        self.edit_flow_window = None
-        self.button_start_traffic_monitoring = None
-        self.button_stop_traffic_monitoring = None
-        self.label_traffic_monitor_summary = None
-        self.edit_traffic_monitor_detail = None
+        # Reset タブ: 配置済みBarricadeの解除・強制リセット
+        self.tabReset = None
+        self.groupReset = None
+        self.button_reset_obstruction = None
+        self.button_clear_all = None
 
         self.EventList = []
 
@@ -1100,8 +1190,7 @@ class RibbonUI:
             self.edit_traffic_monitor_detail.Text = ''
             return
         self.edit_traffic_monitor_detail.Text = (
-            f"Barricade Index: {metrics['index']}\r\n"
-            f"Flow: {metrics['flowVehPerHour']:.0f} veh/h\r\n"
+            f"CSV Record Index: {metrics['index']}\r\n"
             f"Avg Speed: {metrics['avgSpeedKmh']:.1f} km/h\r\n"
             f"Vehicles in Zone: {metrics['vehicleCount']}")
 
@@ -1110,7 +1199,7 @@ class RibbonUI:
         self.ribbonMenu = mainForm.MainRibbonMenu
 
         # === CSV タブ: Predictionフォルダ内のCSVファイルの選択・読み込み ===
-        self.tabCsv = self.MakeRibbonTab(self.ribbonMenu, 'RoadBlockagePluginCsv', 'Road Blockage: CSV')
+        self.tabCsv = self.MakeRibbonTab(self.ribbonMenu, 'RoadBlockagePluginCsv', 'CSV')
         self.groupCsv = self.MakeRibbonGroup(self.tabCsv, 'GroupCsv', 'CSV')
 
         self.button_browse_csv = self.MakeRibbonButton(
@@ -1120,9 +1209,10 @@ class RibbonUI:
         self.label_csv_summary = self.MakeRibbonLabel(self.groupCsv, 'LabelCsvSummary', 'No CSV loaded.')
         self.label_csv_summary.Width = 420
 
-        # === Barricades タブ: CSVレコードに基づく障害物の設置・確認 ===
+        # === Barricades タブ: CSVレコードに基づく障害物の設置(検索・ジャンプ機能は
+        # Find Objects タブに集約している) ===
         self.tabBarricades = self.MakeRibbonTab(
-            self.ribbonMenu, 'RoadBlockagePluginBarricades', 'Road Blockage: Barricades')
+            self.ribbonMenu, 'RoadBlockagePluginBarricades', 'Barricades')
         self.groupBarricades = self.MakeRibbonGroup(self.tabBarricades, 'GroupBarricades', 'Barricades')
 
         # 確率(Probability)がこの値以上のCSVレコードだけを配置対象にする
@@ -1146,38 +1236,73 @@ class RibbonUI:
         self.label_barricades_summary = self.MakeRibbonLabel(self.groupBarricades, 'LabelBarricadesSummary', '')
         self.label_barricades_summary.Width = 420
 
+        # === Traffic Monitor タブ: 選択した1件のCSVレコード位置の交通流計測・HUD表示 ===
+        self.tabTrafficMonitor = self.MakeRibbonTab(
+            self.ribbonMenu, 'RoadBlockagePluginTrafficMonitor', 'Traffic Monitor')
+        self.groupTrafficMonitor = self.MakeRibbonGroup(
+            self.tabTrafficMonitor, 'GroupTrafficMonitor', 'Traffic Monitor')
+
+        # 計測対象とするCSVレコードをインデックスで1件選ぶ(loadedCsvRecordsの順)。
+        # Barricadeの配置とは独立しているため、配置していなくても計測できる
+        self.label_record_index = self.MakeRibbonLabel(
+            self.groupTrafficMonitor, 'LabelRecordIndex', 'CSV Record Index')
+        self.edit_record_index = self.MakeRibbonEdit(self.groupTrafficMonitor, 'EditRecordIndex', '0')
+
+        # 選んだ位置からこの半径(m)以内にいる車両を計測対象にする
+        self.label_measurement_radius = self.MakeRibbonLabel(
+            self.groupTrafficMonitor, 'LabelMeasurementRadius', 'Measurement Radius (m)')
+        self.edit_measurement_radius = self.MakeRibbonEdit(
+            self.groupTrafficMonitor, 'EditMeasurementRadius', '50')
+
+        self.button_start_traffic_monitoring = self.MakeRibbonButton(
+            self.groupTrafficMonitor, 'ButtonStartTrafficMonitoring', 'Start Monitoring',
+            RibbonButtonHandlerStartTrafficMonitoring)
+        self.button_start_traffic_monitoring.Width = 160
+
+        self.button_stop_traffic_monitoring = self.MakeRibbonButton(
+            self.groupTrafficMonitor, 'ButtonStopTrafficMonitoring', 'Stop Monitoring',
+            RibbonButtonHandlerStopTrafficMonitoring)
+        self.button_stop_traffic_monitoring.Width = 160
+
+        self.label_traffic_monitor_summary = self.MakeRibbonLabel(
+            self.groupTrafficMonitor, 'LabelTrafficMonitorSummary', 'Not monitoring.')
+        self.label_traffic_monitor_summary.Width = 480
+
+        # 計測結果の詳細(画面上のHUDと同じ内容をリボン側にもテキストエリア風に表示する)。
+        # リボンにはコンボボックス/リストボックスや複数行入力欄の専用コントロールが
+        # 無いため(IF8MainRibbonGroupProxyで確認できるのはCreateButton/CheckBox/
+        # Edit/Label/Panelのみ)、Editの高さを広げてText内で改行して代用している
+        self.edit_traffic_monitor_detail = self.MakeRibbonEdit(
+            self.groupTrafficMonitor, 'EditTrafficMonitorDetail', '')
+        self.edit_traffic_monitor_detail.Width = 260
+        self.edit_traffic_monitor_detail.Height = 80
+
+        # === Find Objects タブ: 配置したBarricadeと、道路に既存の道路障害物を、
+        # それぞれインデックス指定で検索(一覧・カメラジャンプ)する機能をここに集約する ===
+        self.tabFindObjects = self.MakeRibbonTab(
+            self.ribbonMenu, 'RoadBlockagePluginObstructions', 'Find Objects')
+
+        # -- 配置したBarricadeを探すグループ --
+        self.groupFindBarricades = self.MakeRibbonGroup(
+            self.tabFindObjects, 'GroupFindBarricades', 'Barricades')
+
         # 配置したBarricadeの場所がわかりにくいため、指定したインデックスのBarricadeへ
         # メインカメラをジャンプさせて見た目を確認できるようにする
-        self.label_jump_index = self.MakeRibbonLabel(self.groupBarricades, 'LabelJumpIndex', 'Barricade Index')
-        self.edit_jump_index = self.MakeRibbonEdit(self.groupBarricades, 'EditJumpIndex', '0')
+        self.label_jump_index = self.MakeRibbonLabel(
+            self.groupFindBarricades, 'LabelJumpIndex', 'Barricade Index')
+        self.edit_jump_index = self.MakeRibbonEdit(self.groupFindBarricades, 'EditJumpIndex', '0')
 
         self.button_jump_to_barricade = self.MakeRibbonButton(
-            self.groupBarricades, 'ButtonJumpToBarricade', 'Jump to Barricade', RibbonButtonHandlerJumpToBarricade)
+            self.groupFindBarricades, 'ButtonJumpToBarricade', 'Jump to Barricade',
+            RibbonButtonHandlerJumpToBarricade)
         self.button_jump_to_barricade.Width = 160
 
-        self.label_jump_summary = self.MakeRibbonLabel(self.groupBarricades, 'LabelJumpSummary', '')
+        self.label_jump_summary = self.MakeRibbonLabel(self.groupFindBarricades, 'LabelJumpSummary', '')
         self.label_jump_summary.Width = 420
 
-        # === Reset タブ: 配置済みBarricadeの解除・強制リセット ===
-        self.tabReset = self.MakeRibbonTab(
-            self.ribbonMenu, 'RoadBlockagePluginReset', 'Road Blockage: Reset')
-        self.groupReset = self.MakeRibbonGroup(self.tabReset, 'GroupReset', 'Reset')
-
-        self.button_reset_obstruction = self.MakeRibbonButton(
-            self.groupReset, 'ButtonResetObstruction', 'Reset', RibbonButtonHandlerResetObstruction)
-        self.button_reset_obstruction.Width = 160
-
-        # 過去の実行がクラッシュ等で正常終了せず、道路上に残ってしまった一時オブジェクトを
-        # 一掃するための強制リセット。通常の走行中の交通車両にも影響しうる点に注意
-        self.button_clear_all = self.MakeRibbonButton(
-            self.groupReset, 'ButtonClearAll', 'Clear All', RibbonButtonHandlerClearAll)
-        self.button_clear_all.Width = 160
-
-        # === Obstructions タブ: 道路に既存の道路障害物の一覧 ===
-        self.tabObstructions = self.MakeRibbonTab(
-            self.ribbonMenu, 'RoadBlockagePluginObstructions', 'Road Blockage: Obstructions')
+        # -- 道路に既存の道路障害物(F8RoadObstructionProxy)を探すグループ --
         self.groupObstructions = self.MakeRibbonGroup(
-            self.tabObstructions, 'GroupObstructions', 'Road Obstructions')
+            self.tabFindObjects, 'GroupObstructions', 'Road Obstructions')
 
         self.button_list_obstructions = self.MakeRibbonButton(
             self.groupObstructions, 'ButtonListObstructions', 'List Obstructions',
@@ -1220,89 +1345,44 @@ class RibbonUI:
             self.groupObstructions, 'LabelObstructionJumpSummary', '')
         self.label_obstruction_jump_summary.Width = 420
 
-        # === Traffic Monitor タブ: 選択した1件のBarricade周辺の交通流計測・HUD表示 ===
-        self.tabTrafficMonitor = self.MakeRibbonTab(
-            self.ribbonMenu, 'RoadBlockagePluginTrafficMonitor', 'Road Blockage: Traffic Monitor')
-        self.groupTrafficMonitor = self.MakeRibbonGroup(
-            self.tabTrafficMonitor, 'GroupTrafficMonitor', 'Traffic Monitor')
+        # === Reset タブ: 配置済みBarricadeの解除・強制リセット ===
+        self.tabReset = self.MakeRibbonTab(
+            self.ribbonMenu, 'RoadBlockagePluginReset', 'Reset')
+        self.groupReset = self.MakeRibbonGroup(self.tabReset, 'GroupReset', 'Reset')
 
-        # 計測対象とするBarricadeをインデックスで1件選ぶ(currentObstructionsの順)
-        self.label_zone_index = self.MakeRibbonLabel(
-            self.groupTrafficMonitor, 'LabelZoneIndex', 'Barricade Index')
-        self.edit_zone_index = self.MakeRibbonEdit(self.groupTrafficMonitor, 'EditZoneIndex', '0')
+        self.button_reset_obstruction = self.MakeRibbonButton(
+            self.groupReset, 'ButtonResetObstruction', 'Reset', RibbonButtonHandlerResetObstruction)
+        self.button_reset_obstruction.Width = 160
 
-        # 選んだBarricadeの位置からこの半径(m)以内にいる車両を計測対象にする
-        self.label_measurement_radius = self.MakeRibbonLabel(
-            self.groupTrafficMonitor, 'LabelMeasurementRadius', 'Measurement Radius (m)')
-        self.edit_measurement_radius = self.MakeRibbonEdit(
-            self.groupTrafficMonitor, 'EditMeasurementRadius', '50')
-
-        # 流量(単位時間あたりの新規進入台数)を計算する際の移動集計ウィンドウ(秒)
-        self.label_flow_window = self.MakeRibbonLabel(
-            self.groupTrafficMonitor, 'LabelFlowWindow', 'Flow Window (s)')
-        self.edit_flow_window = self.MakeRibbonEdit(
-            self.groupTrafficMonitor, 'EditFlowWindow', '60')
-
-        self.button_start_traffic_monitoring = self.MakeRibbonButton(
-            self.groupTrafficMonitor, 'ButtonStartTrafficMonitoring', 'Start Monitoring',
-            RibbonButtonHandlerStartTrafficMonitoring)
-        self.button_start_traffic_monitoring.Width = 160
-
-        self.button_stop_traffic_monitoring = self.MakeRibbonButton(
-            self.groupTrafficMonitor, 'ButtonStopTrafficMonitoring', 'Stop Monitoring',
-            RibbonButtonHandlerStopTrafficMonitoring)
-        self.button_stop_traffic_monitoring.Width = 160
-
-        self.label_traffic_monitor_summary = self.MakeRibbonLabel(
-            self.groupTrafficMonitor, 'LabelTrafficMonitorSummary', 'Not monitoring.')
-        self.label_traffic_monitor_summary.Width = 480
-
-        # 計測結果の詳細(画面上のHUDと同じ内容をリボン側にもテキストエリア風に表示する)。
-        # リボンにはコンボボックス/リストボックスや複数行入力欄の専用コントロールが
-        # 無いため(IF8MainRibbonGroupProxyで確認できるのはCreateButton/CheckBox/
-        # Edit/Label/Panelのみ)、Editの高さを広げてText内で改行して代用している
-        self.edit_traffic_monitor_detail = self.MakeRibbonEdit(
-            self.groupTrafficMonitor, 'EditTrafficMonitorDetail', '')
-        self.edit_traffic_monitor_detail.Width = 260
-        self.edit_traffic_monitor_detail.Height = 80
+        # 過去の実行がクラッシュ等で正常終了せず、道路上に残ってしまった一時オブジェクトを
+        # 一掃するための強制リセット。通常の走行中の交通車両にも影響しうる点に注意
+        self.button_clear_all = self.MakeRibbonButton(
+            self.groupReset, 'ButtonClearAll', 'Clear All', RibbonButtonHandlerClearAll)
+        self.button_clear_all.Width = 160
 
     def KillRibbonUI(self):
         # MakeRibbonUIが途中で失敗していても後始末できるよう、
-        # 各ステップはNoneチェックしてから実行する
+        # 各ステップはNoneチェックしてから実行する(MakeRibbonUIと逆順に解体する)
         self.CloseCallbackEvent()
 
-        # --- Traffic Monitor タブ ---
-        if self.groupTrafficMonitor is not None:
-            for button in (self.button_stop_traffic_monitoring, self.button_start_traffic_monitoring):
+        # --- Reset タブ ---
+        if self.groupReset is not None:
+            for button in (self.button_clear_all, self.button_reset_obstruction):
                 if button is not None:
                     button.UnRegisterEventHandlers()
-                    self.groupTrafficMonitor.DeleteControl(button)
-            self.button_stop_traffic_monitoring = None
-            self.button_start_traffic_monitoring = None
-            for ctrl in (self.edit_traffic_monitor_detail, self.label_traffic_monitor_summary,
-                         self.edit_flow_window, self.label_flow_window,
-                         self.edit_measurement_radius, self.label_measurement_radius,
-                         self.edit_zone_index, self.label_zone_index):
-                if ctrl is not None:
-                    self.groupTrafficMonitor.DeleteControl(ctrl)
-            self.edit_traffic_monitor_detail = None
-            self.label_traffic_monitor_summary = None
-            self.edit_flow_window = None
-            self.label_flow_window = None
-            self.edit_measurement_radius = None
-            self.label_measurement_radius = None
-            self.edit_zone_index = None
-            self.label_zone_index = None
-            if self.tabTrafficMonitor is not None:
-                self.tabTrafficMonitor.DeleteGroup(self.groupTrafficMonitor)
-            self.groupTrafficMonitor = None
+                    self.groupReset.DeleteControl(button)
+            self.button_clear_all = None
+            self.button_reset_obstruction = None
+            if self.tabReset is not None:
+                self.tabReset.DeleteGroup(self.groupReset)
+            self.groupReset = None
 
-        if self.tabTrafficMonitor is not None:
-            if self.tabTrafficMonitor.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
-                self.ribbonMenu.DeleteTab(self.tabTrafficMonitor)
-            self.tabTrafficMonitor = None
+        if self.tabReset is not None:
+            if self.tabReset.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
+                self.ribbonMenu.DeleteTab(self.tabReset)
+            self.tabReset = None
 
-        # --- Road Obstructions タブ ---
+        # --- Find Objects タブ ---
         if self.panel_obstructions is not None:
             for label in self.obstructionItemLabels:
                 self.panel_obstructions.DeleteControl(label)
@@ -1330,49 +1410,69 @@ class RibbonUI:
             self.edit_obstruction_jump_index = None
             self.label_obstruction_jump_index = None
             self.label_obstruction_jump_summary = None
-            if self.tabObstructions is not None:
-                self.tabObstructions.DeleteGroup(self.groupObstructions)
+            if self.tabFindObjects is not None:
+                self.tabFindObjects.DeleteGroup(self.groupObstructions)
             self.groupObstructions = None
 
-        if self.tabObstructions is not None:
-            if self.tabObstructions.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
-                self.ribbonMenu.DeleteTab(self.tabObstructions)
-            self.tabObstructions = None
+        if self.groupFindBarricades is not None:
+            if self.button_jump_to_barricade is not None:
+                self.button_jump_to_barricade.UnRegisterEventHandlers()
+                self.groupFindBarricades.DeleteControl(self.button_jump_to_barricade)
+                self.button_jump_to_barricade = None
+            for ctrl in (self.edit_jump_index, self.label_jump_index, self.label_jump_summary):
+                if ctrl is not None:
+                    self.groupFindBarricades.DeleteControl(ctrl)
+            self.edit_jump_index = None
+            self.label_jump_index = None
+            self.label_jump_summary = None
+            if self.tabFindObjects is not None:
+                self.tabFindObjects.DeleteGroup(self.groupFindBarricades)
+            self.groupFindBarricades = None
 
-        # --- Reset タブ ---
-        if self.groupReset is not None:
-            for button in (self.button_clear_all, self.button_reset_obstruction):
+        if self.tabFindObjects is not None:
+            if self.tabFindObjects.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
+                self.ribbonMenu.DeleteTab(self.tabFindObjects)
+            self.tabFindObjects = None
+
+        # --- Traffic Monitor タブ ---
+        if self.groupTrafficMonitor is not None:
+            for button in (self.button_stop_traffic_monitoring, self.button_start_traffic_monitoring):
                 if button is not None:
                     button.UnRegisterEventHandlers()
-                    self.groupReset.DeleteControl(button)
-            self.button_clear_all = None
-            self.button_reset_obstruction = None
-            if self.tabReset is not None:
-                self.tabReset.DeleteGroup(self.groupReset)
-            self.groupReset = None
+                    self.groupTrafficMonitor.DeleteControl(button)
+            self.button_stop_traffic_monitoring = None
+            self.button_start_traffic_monitoring = None
+            for ctrl in (self.edit_traffic_monitor_detail, self.label_traffic_monitor_summary,
+                         self.edit_measurement_radius, self.label_measurement_radius,
+                         self.edit_record_index, self.label_record_index):
+                if ctrl is not None:
+                    self.groupTrafficMonitor.DeleteControl(ctrl)
+            self.edit_traffic_monitor_detail = None
+            self.label_traffic_monitor_summary = None
+            self.edit_measurement_radius = None
+            self.label_measurement_radius = None
+            self.edit_record_index = None
+            self.label_record_index = None
+            if self.tabTrafficMonitor is not None:
+                self.tabTrafficMonitor.DeleteGroup(self.groupTrafficMonitor)
+            self.groupTrafficMonitor = None
 
-        if self.tabReset is not None:
-            if self.tabReset.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
-                self.ribbonMenu.DeleteTab(self.tabReset)
-            self.tabReset = None
+        if self.tabTrafficMonitor is not None:
+            if self.tabTrafficMonitor.RibbonGroupsCount == 0 and self.ribbonMenu is not None:
+                self.ribbonMenu.DeleteTab(self.tabTrafficMonitor)
+            self.tabTrafficMonitor = None
 
         # --- Barricades タブ ---
         if self.groupBarricades is not None:
-            for button in (self.button_jump_to_barricade, self.button_place_barricades):
-                if button is not None:
-                    button.UnRegisterEventHandlers()
-                    self.groupBarricades.DeleteControl(button)
-            self.button_jump_to_barricade = None
+            if self.button_place_barricades is not None:
+                self.button_place_barricades.UnRegisterEventHandlers()
+                self.groupBarricades.DeleteControl(self.button_place_barricades)
             self.button_place_barricades = None
-            for ctrl in (self.edit_jump_index, self.label_jump_index,
-                         self.label_jump_summary, self.label_barricades_summary,
+            for ctrl in (self.label_barricades_summary,
                          self.edit_max_road_distance, self.label_max_road_distance,
                          self.edit_probability_threshold, self.label_probability_threshold):
                 if ctrl is not None:
                     self.groupBarricades.DeleteControl(ctrl)
-            self.edit_jump_index = None
-            self.label_jump_index = None
-            self.label_jump_summary = None
             self.label_barricades_summary = None
             self.edit_max_road_distance = None
             self.label_max_road_distance = None
@@ -1423,7 +1523,7 @@ def main():
     global loadedCsvRecords
     global hudOverlay
     global trafficMonitoring
-    global monitoredZoneIndex
+    global monitoredRecordIndex
     global monitoredPosition
     winRoadProxy = None
     logProxy = None
@@ -1435,7 +1535,7 @@ def main():
     loadedCsvRecords = []
     hudOverlay = None
     trafficMonitoring = False
-    monitoredZoneIndex = None
+    monitoredRecordIndex = None
     monitoredPosition = None
     ResetTrafficMetricsState()
 
